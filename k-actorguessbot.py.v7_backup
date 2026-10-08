@@ -1,4 +1,4 @@
-# kdramabot.py — Korean Actor/Actress Guess Bot v3
+# kdramabot.py — Korean Actor/Actress Guess Bot v4
 # target: Python 3.11 · python-telegram-bot 21.x · Pillow 10+ · requests
 import os, io, time, math, shutil, random, sqlite3, logging, threading, json, asyncio
 from contextlib import contextmanager
@@ -42,6 +42,7 @@ REQUIRED_CHANNELS = [
 SPAWN_MESSAGE_THRESHOLD = 100
 SPAWN_EXPIRY_SECONDS    = 600
 GUESS_REWARD_COINS      = 50
+VIEWTIME_COST           = 50
 
 DAILY_COINS     = 100
 WEEKLY_COINS    = 2000
@@ -49,14 +50,16 @@ DAILY_COOLDOWN  = timedelta(hours=24)
 WEEKLY_COOLDOWN = timedelta(days=7)
 CLAIM_COOLDOWN  = timedelta(hours=24)
 
+# Spam filter
+SPAM_WINDOW       = 60     # 1 minute window
+SPAM_LIMIT        = 10     # 10+ messages in window → spam
+SPAM_LEVEL1_IGNORE = 300   # 5 min
+SPAM_LEVEL2_IGNORE = 1200  # 20 min
+
 BACKUP_DIR  = "backups"
 BACKUP_KEEP = 10
 TELEGRAPH_DELAY = 1.2
 ACTOR_CACHE_TTL = 60
-
-# Spam filter
-SPAM_WINDOW = 120       # 2 minutes
-SPAM_LIMIT  = 15        # messages per window
 
 CLAIM_WEIGHTS = {
     "Extra":50, "Side":40, "Supporting":30, "Main Cast":15,
@@ -73,8 +76,8 @@ STATUS = {"bot_ready": False, "last_spawn_ts": None, "last_error": None}
 _ACTOR_CACHE = {"ids": [], "rarities": {}, "ts": 0}
 _CACHE_LOCK = threading.Lock()
 
-_SPAM_TRACK = {}   # {(chat_id, user_id): [timestamps]}
-_SPAM_LOCK = threading.Lock()
+_SPAM_TRACK = {}   # {(chat_id, user_id): {"times": [...], "ignore_until": ts, "level": N}}
+_SPAM_LOCK  = threading.Lock()
 
 
 # ═══════════════ FONTS ═══════════════
@@ -90,15 +93,6 @@ def bi(t):
     for ch in t:
         if "A" <= ch <= "Z": o.append(chr(0x1D468 + ord(ch) - ord("A")))
         elif "a" <= ch <= "z": o.append(chr(0x1D482 + ord(ch) - ord("a")))
-        else: o.append(ch)
-    return "".join(o)
-
-def bold(t):
-    o = []
-    for ch in t:
-        if "A" <= ch <= "Z": o.append(chr(0x1D400 + ord(ch) - ord("A")))
-        elif "a" <= ch <= "z": o.append(chr(0x1D41A + ord(ch) - ord("a")))
-        elif "0" <= ch <= "9": o.append(chr(0x1D7CE + ord(ch) - ord("0")))
         else: o.append(ch)
     return "".join(o)
 
@@ -211,6 +205,17 @@ def init_db():
     try: c.execute("ALTER TABLE players ADD COLUMN last_claim TEXT")
     except sqlite3.OperationalError: pass
     conn.commit()
+
+    # SAFETY: force-expire all stale active spawns on startup
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        c.execute("UPDATE spawns SET status='expired' WHERE status='active' AND expires_at<?", (now_iso,))
+        n = c.rowcount
+        if n: log.info(f"[init] force-expired {n} stale spawns")
+        conn.commit()
+    except Exception as e:
+        log.warning(f"[init] expire failed: {e}")
+
     log.info("DB initialized (pooled)")
 
 
@@ -255,9 +260,10 @@ def add_coins_and_points(user_id, coins=0, points=0):
 def add_coins(user_id, amount):
     with get_conn() as conn:
         c = conn.cursor()
-        c.execute("UPDATE players SET coins = COALESCE(coins,0) + ? WHERE user_id=?", (amount, user_id))
+        c.execute("UPDATE players SET coins = MAX(0, COALESCE(coins,0) + ?) WHERE user_id=?",
+                  (amount, user_id))
         if c.rowcount == 0:
-            c.execute("INSERT INTO players (user_id, coins) VALUES (?,?)", (user_id, amount))
+            c.execute("INSERT INTO players (user_id, coins) VALUES (?,?)", (user_id, max(0, amount)))
 
 
 def get_coins(user_id):
@@ -513,11 +519,21 @@ def set_spawn_message(sid, mid):
 
 
 def get_active_spawn(chat_id):
+    """Return active spawn only if it hasn't expired. Auto-expires stale ones."""
     c = _conn().cursor()
     c.execute("""SELECT * FROM spawns WHERE chat_id=? AND status='active'
                  ORDER BY id DESC LIMIT 1""", (chat_id,))
     row = c.fetchone()
-    return dict(row) if row else None
+    if not row: return None
+    d = dict(row)
+    # safety: check expiry manually
+    exp = _parse_dt(d.get("expires_at"))
+    if exp and exp < _now():
+        with get_conn() as conn2:
+            conn2.execute("UPDATE spawns SET status='expired' WHERE id=?", (d["id"],))
+        log.info(f"[auto-expire] spawn {d['id']} in chat {chat_id}")
+        return None
+    return d
 
 
 def try_grab_spawn(spawn_id, user_id):
@@ -581,6 +597,13 @@ def track_group_member(chat_id, user_id):
     with get_conn() as conn:
         conn.execute("INSERT OR IGNORE INTO group_members (chat_id, user_id) VALUES (?,?)",
                      (chat_id, user_id))
+
+
+def get_group_stats(chat_id):
+    c = _conn().cursor()
+    c.execute("SELECT msg_count, total_spawns, last_spawn FROM group_counters WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    return dict(row) if row else {"msg_count": 0, "total_spawns": 0, "last_spawn": None}
 
 
 def db_stats():
@@ -652,6 +675,49 @@ def role_emoji(r): return "👨" if r == "actor" else "👩"
 def role_label(r): return "Actor" if r == "actor" else "Actress"
 
 
+# ═══════════════ SPAM FILTER (with escalation) ═══════════════
+def check_spam(chat_id, user_id):
+    """
+    Returns (is_ignored, alert_needed, ignore_minutes, level).
+    Escalation: level 1 → 5 min ignore, level 2+ → 20 min ignore.
+    """
+    now = time.time()
+    with _SPAM_LOCK:
+        key = (chat_id, user_id)
+        state = _SPAM_TRACK.get(key)
+        if state is None:
+            state = {"times": [], "ignore_until": 0, "level": 0}
+            _SPAM_TRACK[key] = state
+
+        # gc safety
+        if len(_SPAM_TRACK) > 5000:
+            cutoff = now - 3600
+            for k in list(_SPAM_TRACK.keys()):
+                st = _SPAM_TRACK[k]
+                if st["ignore_until"] < now and (not st["times"] or max(st["times"]) < cutoff):
+                    _SPAM_TRACK.pop(k, None)
+
+        # inside ignore window?
+        if state["ignore_until"] > now:
+            return (True, False, 0, state["level"])
+        # ignore expired — reset alert but keep level for escalation
+        if state["ignore_until"] > 0 and state["ignore_until"] <= now:
+            state["ignore_until"] = 0
+
+        # prune timestamps
+        state["times"] = [t for t in state["times"] if now - t < SPAM_WINDOW]
+        state["times"].append(now)
+
+        if len(state["times"]) >= SPAM_LIMIT:
+            state["level"] += 1
+            duration = SPAM_LEVEL1_IGNORE if state["level"] == 1 else SPAM_LEVEL2_IGNORE
+            state["ignore_until"] = now + duration
+            state["times"] = []
+            return (True, True, duration // 60, state["level"])
+
+        return (False, False, 0, state["level"])
+
+
 # ═══════════════ TELEGRAPH ═══════════════
 async def fileid_to_public_url(bot, file_id):
     if not file_id: return None
@@ -704,7 +770,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             ok, integrity = db_integrity_check()
             payload = {
                 "status": "ok" if ok and STATUS["bot_ready"] else "degraded",
-                "service": "korean-guess-bot", "version": "v3",
+                "service": "korean-guess-bot", "version": "v4",
                 "uptime_seconds": up, "uptime_human": str(timedelta(seconds=up)),
                 "bot_ready": STATUS["bot_ready"], "bot_username": BOT_USERNAME,
                 "db": {
@@ -712,9 +778,6 @@ class _HealthHandler(BaseHTTPRequestHandler):
                     "size_kb": os.path.getsize(DB_PATH)//1024 if os.path.exists(DB_PATH) else 0,
                     "integrity": integrity, "counts": db_stats(),
                 },
-                "actor_cache": {"ids": len(_ACTOR_CACHE["ids"]),
-                                "age_s": int(time.time() - _ACTOR_CACHE["ts"]) if _ACTOR_CACHE["ts"] else 0},
-                "last_spawn_ts": STATUS["last_spawn_ts"],
                 "ts": datetime.utcnow().isoformat() + "Z",
             }
             self._send(200 if payload["status"] == "ok" else 503, payload)
@@ -733,22 +796,6 @@ def start_health_server():
         log.info(f"Health: http://{HEALTH_HOST}:{PORT}/health")
     except Exception as e:
         log.warning(f"health skipped: {e}")
-
-
-# ═══════════════ SPAM FILTER ═══════════════
-def is_spamming(chat_id, user_id):
-    now = time.time()
-    with _SPAM_LOCK:
-        key = (chat_id, user_id)
-        times = _SPAM_TRACK.get(key, [])
-        # prune old
-        times = [t for t in times if now - t < SPAM_WINDOW]
-        times.append(now)
-        _SPAM_TRACK[key] = times
-        # garbage collect: remove empty entries (safety)
-        if len(_SPAM_TRACK) > 5000:
-            _SPAM_TRACK.clear()
-        return len(times) > SPAM_LIMIT
 
 
 # ═══════════════ HELPERS ═══════════════
@@ -771,7 +818,6 @@ def kb_join():
 
 
 def kb_start_main():
-    """3 layers · 4 buttons: Add Me / Support + Help / Owner."""
     add_link = f"https://t.me/{BOT_USERNAME}?startgroup=true"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"➕ {sc('Add Me To Your GC')} ➕", url=add_link)],
@@ -834,7 +880,7 @@ HELP_TEXT = (
     "🎁 <code>/gift</code> — Gift a character\n"
     "🎰 <code>/claim</code> — Free random character (24h)\n"
     "🔎 <code>/check &lt;id&gt;</code> — Actor info by ID\n"
-    "⏰ <code>/viewtime</code> — Gate progress\n"
+    "⏰ <code>/viewtime</code> — Gate timer (50 coins)\n"
     "🏆 <code>/rankings</code> — Leaderboards\n"
     "💰 <code>/daily</code> — 100 coins (24h)\n"
     "💰 <code>/weekly</code> — 2000 coins (7d)\n\n"
@@ -959,43 +1005,79 @@ async def cmd_balance(update, context):
         parse_mode="HTML")
 
 
-# ═══════════════ VIEWTIME ═══════════════
+# ═══════════════ VIEWTIME — costs 50 coins ═══════════════
 async def cmd_viewtime(update, context):
     chat = update.effective_chat
+    u = update.effective_user
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text("❌ This command works in groups only."); return
-    active = get_active_spawn(chat.id)
-    if active:
+
+    get_or_create_player(u.id, u.username, u.first_name)
+    coins = get_coins(u.id)
+    if coins < VIEWTIME_COST:
         await update.message.reply_text(
-            "⚠️ <b>A spawn is already active.</b>\n\n"
-            "Use <code>/guess &lt;name&gt;</code> to grab it.",
+            f"❌ <b>You don't have coins to see down time.</b>\n\n"
+            f"💵 Needed: <b>{VIEWTIME_COST}</b> coins\n"
+            f"💼 You have: <b>{coins}</b>",
             parse_mode="HTML")
         return
+
+    add_coins(u.id, -VIEWTIME_COST)
+
+    # active spawn?
+    active = get_active_spawn(chat.id)
+    if active:
+        exp = _parse_dt(active.get("expires_at"))
+        now = _now()
+        if exp:
+            left_sec = max(0, int((exp - now).total_seconds()))
+            m, s = divmod(left_sec, 60)
+            time_str = f"{m}m {s}s"
+        else:
+            time_str = "—"
+        await update.message.reply_text(
+            f"⏰ <b>A spawn is active</b>\n\n"
+            f"⏳ Time left: <b>{time_str}</b>\n\n"
+            f"Use <code>/guess &lt;name&gt;</code> to grab it.",
+            parse_mode="HTML")
+        return
+
     stats = get_group_stats(chat.id)
     cur = stats.get("msg_count", 0)
-    total = stats.get("total_spawns", 0)
-    last = stats.get("last_spawn")
+    last_spawn = stats.get("last_spawn")
     rem = max(0, SPAWN_MESSAGE_THRESHOLD - cur)
     pct = min(100, int((cur / SPAWN_MESSAGE_THRESHOLD) * 100))
     filled = int(pct / 10)
     bar = "█" * filled + "░" * (10 - filled)
+
+    # estimated wait time based on rate since last spawn
+    est_str = ""
+    if last_spawn and cur > 0:
+        try:
+            last_dt = datetime.fromisoformat(last_spawn)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            elapsed = (_now() - last_dt).total_seconds()
+            if elapsed > 0 and cur > 0:
+                per_msg = elapsed / cur
+                est_sec = int(per_msg * rem)
+                em, es = divmod(est_sec, 60)
+                if em >= 60:
+                    eh, em = divmod(em, 60)
+                    est_str = f"\n⏱ Estimated: <b>~{eh}h {em}m</b>"
+                else:
+                    est_str = f"\n⏱ Estimated: <b>~{em}m {es}s</b>"
+        except Exception: pass
+
     txt = (
-        "⏰ <b>GATE STATUS</b>\n\n"
+        f"⏰ <b>Gate Status</b>\n\n"
         f"📨 Messages: <b>{cur}/{SPAWN_MESSAGE_THRESHOLD}</b>\n"
         f"📊 <code>{bar}</code> <b>{pct}%</b>\n\n"
-        f"⏳ <b>{rem}</b> messages until next spawn\n"
-        f"🎯 Total spawns: <b>{total}</b>"
+        f"⏳ Need <b>{rem}</b> more messages"
+        f"{est_str}\n\n"
+        f"<i>-{VIEWTIME_COST} coins</i>"
     )
-    if last:
-        txt += f"\n🕐 Last spawn: <code>{last}</code>"
     await update.message.reply_text(txt, parse_mode="HTML")
-
-
-def get_group_stats(chat_id):
-    c = _conn().cursor()
-    c.execute("SELECT msg_count, total_spawns, last_spawn FROM group_counters WHERE chat_id=?", (chat_id,))
-    row = c.fetchone()
-    return dict(row) if row else {"msg_count": 0, "total_spawns": 0, "last_spawn": None}
 
 
 # ═══════════════ RANKINGS ═══════════════
@@ -1004,22 +1086,19 @@ async def cmd_rankings(update, context):
         parse_mode="HTML", reply_markup=_kb_rankings())
 
 
-# ═══════════════ INLINE QUERY (collection) ═══════════════
+# ═══════════════ INLINE QUERY ═══════════════
 async def inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw = (update.inline_query.query or "").strip()
     uid = update.inline_query.from_user.id
     log.info(f"[inline] raw='{raw}' uid={uid}")
 
     low = raw.lower()
-
     target = uid
     mode = "search"
     search_q = raw
 
-    # Detect collection mode
     if low.startswith("collection") or low == "my":
         mode = "collection"
-        # collection.<uid> or collection <uid> or collection.uid
         suffix = ""
         if "." in raw:
             suffix = raw.split(".", 1)[1].strip()
@@ -1487,9 +1566,9 @@ async def cmd_weekly(update, context):
         f"💼 Balance: <b>{get_coins(u.id)}</b>\n⏰ Next in 7 days", parse_mode="HTML")
 
 
-# ═══════════════ SPAWN ═══════════════
+# ═══════════════ MESSAGE TRACKER + SPAM ═══════════════
 async def track_message(update, context):
-    """Message counter + spawn trigger + spam filter."""
+    """Count messages, trigger spawns, handle spam."""
     try:
         chat = update.effective_chat
         if chat.type not in ("group", "supergroup"): return
@@ -1498,8 +1577,25 @@ async def track_message(update, context):
         chat_id = chat.id
         user_id = u.id
 
-        # spam check — if user is spamming, ignore their messages entirely
-        if is_spamming(chat_id, user_id):
+        # spam check first
+        ignored, alert, minutes, level = check_spam(chat_id, user_id)
+        if ignored:
+            if alert:
+                mention = f"@{u.username}" if u.username else u.first_name
+                try:
+                    if level == 1:
+                        await context.bot.send_message(chat_id,
+                            f"🚫 <b>Spam Detected</b>\n\n"
+                            f"{mention}, please slow down.\n"
+                            f"Your messages will be ignored for <b>{minutes} minutes</b>.",
+                            parse_mode="HTML")
+                    else:
+                        await context.bot.send_message(chat_id,
+                            f"🚫 <b>Still Spamming!</b>\n\n"
+                            f"{mention}, you are being ignored for <b>{minutes} minutes</b>.",
+                            parse_mode="HTML")
+                except Exception as e:
+                    log.warning(f"[spam-alert] {e}")
             return
 
         # track member + title
@@ -1508,8 +1604,10 @@ async def track_message(update, context):
             if chat.title: set_group_title(chat_id, chat.title)
         except Exception: pass
 
-        # spawn check
-        if get_active_spawn(chat_id): return
+        # safety: expire stale spawn before checking
+        active = get_active_spawn(chat_id)
+        if active: return
+
         count = incr_msg(chat_id)
         log.info(f"[track] chat={chat_id} count={count}/{SPAWN_MESSAGE_THRESHOLD}")
         if count >= SPAWN_MESSAGE_THRESHOLD:
@@ -1899,6 +1997,12 @@ async def _post_init(app):
         log.warning(f"[startup] migrate failed: {e}")
     _refresh_actor_cache()
     log.info(f"[startup] actor cache: {len(_ACTOR_CACHE['ids'])} ids")
+    # startup safety: force-expire all active spawns (prevent stuck counter)
+    try:
+        n = expire_spawns()
+        if n: log.info(f"[startup] force-expired {n} spawns")
+    except Exception as e:
+        log.warning(f"[startup] expire failed: {e}")
     try:
         asyncio.create_task(background_fix_null_urls(app.bot))
     except Exception as e:
@@ -1984,7 +2088,7 @@ def main():
     app.add_handler(InlineQueryHandler(inline_query))
     app.add_handler(ChosenInlineResultHandler(chosen_inline))
 
-    # Message tracker — LAST group, wide filter
+    # message tracker — last group, broad filter
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
         track_message), group=10)
@@ -1992,7 +2096,7 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(expire_job, interval=30, first=10)
 
-    log.info("Korean Guess Bot v3 starting...")
+    log.info("Korean Guess Bot v4 starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
