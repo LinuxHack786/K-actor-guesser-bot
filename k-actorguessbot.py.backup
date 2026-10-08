@@ -1,0 +1,1153 @@
+# kdramabot.py — Korean Actor/Actress Guess Bot v1
+# target: Python 3.11 · python-telegram-bot 21.x · Pillow 10+
+import os, io, time, math, shutil, random, sqlite3, logging, threading
+from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import httpx
+from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
+                          MessageHandler, ConversationHandler, filters,
+                          ContextTypes)
+
+load_dotenv()
+
+BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
+BOT_USERNAME   = os.getenv("BOT_USERNAME", "YourKDramaBot")
+OWNER_ID       = int(os.getenv("OWNER_ID", "0"))
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "II_DEMONS_SHADOW_II")
+SUPPORT_LINK   = os.getenv("SUPPORT_LINK", "https://t.me/Demon_persnality")
+SUPPORT_NAME   = os.getenv("SUPPORT_NAME", "Demon Personality")
+DB_PATH        = os.getenv("DB_PATH", "kdrama.db")
+LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
+PORT           = int(os.getenv("PORT", "8080"))
+
+BOT_START_TIME = time.time()
+START_PHOTO    = os.getenv("START_PHOTO",
+    "https://i.ibb.co/pBJkk0sL/gyeongbokgung-palace-with-cherry-blossom-spring-seoul-korea-335224-389.jpg")
+
+REQUIRED_CHANNELS = [
+    ("@Abyss_diemension_Animes", "https://t.me/Abyss_diemension_Animes"),
+    ("@Abyss_kdrama_main_channel", "https://t.me/Abyss_kdrama_main_channel"),
+]
+
+SPAWN_MESSAGE_THRESHOLD = 100
+SPAWN_EXPIRY_SECONDS    = 600   # 10 min
+GUESS_REWARD_COINS      = 50
+
+DAILY_COINS     = 100
+WEEKLY_COINS    = 2000
+DAILY_COOLDOWN  = timedelta(hours=24)
+WEEKLY_COOLDOWN = timedelta(days=7)
+
+BACKUP_DIR = "backups"
+
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("kdrama_bot")
+
+
+# ═══════════════ FANCY FONT ═══════════════
+_SMALL_CAPS = {
+    "a":"ᴀ","b":"ʙ","c":"ᴄ","d":"ᴅ","e":"ᴇ","f":"ꜰ","g":"ɢ","h":"ʜ","i":"ɪ","j":"ᴊ",
+    "k":"ᴋ","l":"ʟ","m":"ᴍ","n":"ɴ","o":"ᴏ","p":"ᴘ","q":"ǫ","r":"ʀ","s":"ꜱ","t":"ᴛ",
+    "u":"ᴜ","v":"ᴠ","w":"ᴡ","x":"x","y":"ʏ","z":"ᴢ",
+}
+_BOLD_ITALIC_BASE = 0x1D468   # 𝐀 = 𝘼  (Mathematical bold italic capital A)
+
+
+def small_caps(text: str) -> str:
+    return "".join(_SMALL_CAPS.get(c.lower(), c) for c in text)
+
+
+def bold_italic(text: str) -> str:
+    out = []
+    for ch in text:
+        if "A" <= ch <= "Z":
+            out.append(chr(_BOLD_ITALIC_BASE + ord(ch) - ord("A")))
+        elif "a" <= ch <= "z":
+            out.append(chr(_BOLD_ITALIC_BASE + 26 + ord(ch) - ord("a")))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def italic(text: str) -> str:
+    out = []
+    for ch in text:
+        if "A" <= ch <= "Z":
+            out.append(chr(0x1D434 + ord(ch) - ord("A")))
+        elif "a" <= ch <= "z":
+            out.append(chr(0x1D44E + ord(ch) - ord("a")))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+# ═══════════════ DB ═══════════════
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+    finally:
+        conn.close()
+
+
+def _auto_backup():
+    if not os.path.exists(DB_PATH): return
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dst = os.path.join(BACKUP_DIR, f"kdrama_{stamp}.db")
+        shutil.copy2(DB_PATH, dst)
+        log.info(f"Auto-backup: {dst}")
+        files = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("kdrama_")])
+        for f in files[:-10]:
+            try: os.remove(os.path.join(BACKUP_DIR, f))
+            except Exception: pass
+    except Exception as e:
+        log.warning(f"auto-backup skipped: {e}")
+
+
+def init_db():
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS players (
+            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+            coins INTEGER DEFAULT 0, points INTEGER DEFAULT 0,
+            last_daily TEXT, last_weekly TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS actors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            role TEXT DEFAULT 'actor',
+            rarity TEXT DEFAULT 'Supporting',
+            known_for TEXT DEFAULT '',
+            file_id TEXT, image_url TEXT, image_source TEXT,
+            description TEXT, active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS user_actors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            actor_id INTEGER NOT NULL,
+            grabbed_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS spawns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL, message_id INTEGER,
+            actor_id INTEGER NOT NULL,
+            spawned_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            expires_at TEXT, status TEXT DEFAULT 'active',
+            grabbed_by INTEGER)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS group_counters (
+            chat_id INTEGER PRIMARY KEY, msg_count INTEGER DEFAULT 0,
+            total_spawns INTEGER DEFAULT 0, last_spawn TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY, added_by INTEGER,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    log.info("DB initialized")
+
+
+def _now(): return datetime.now(timezone.utc)
+def _parse_dt(s):
+    if not s: return None
+    try:
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None: d = d.replace(tzinfo=timezone.utc)
+        return d
+    except Exception: return None
+
+
+# ─── Player helpers ───
+def get_or_create_player(uid, username=None, first_name=None):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM players WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        if row:
+            c.execute("""UPDATE players SET username=COALESCE(?,username),
+                first_name=COALESCE(?,first_name) WHERE user_id=?""",
+                (username, first_name, uid))
+            c.execute("SELECT * FROM players WHERE user_id=?", (uid,))
+            return dict(c.fetchone())
+        c.execute("""INSERT INTO players (user_id, username, first_name, coins, points)
+                     VALUES (?,?,?,0,0)""", (uid, username, first_name))
+        c.execute("SELECT * FROM players WHERE user_id=?", (uid,))
+        return dict(c.fetchone())
+
+
+def add_coins(user_id, amount):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE players SET coins = COALESCE(coins,0) + ? WHERE user_id=?",
+                  (amount, user_id))
+        if c.rowcount == 0:
+            c.execute("INSERT INTO players (user_id, coins) VALUES (?,?)", (user_id, amount))
+
+
+def add_points(user_id, amount):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE players SET points = COALESCE(points,0) + ? WHERE user_id=?",
+                  (amount, user_id))
+        if c.rowcount == 0:
+            c.execute("INSERT INTO players (user_id, points) VALUES (?,?)", (user_id, amount))
+
+
+def get_coins(user_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(coins,0) AS c FROM players WHERE user_id=?", (user_id,))
+        row = c.fetchone()
+        return row["c"] if row else 0
+
+
+def get_points(user_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COALESCE(points,0) AS p FROM players WHERE user_id=?", (user_id,))
+        row = c.fetchone()
+        return row["p"] if row else 0
+
+
+# ─── Admins ───
+def is_admin(uid):
+    if uid == OWNER_ID: return True
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM admins WHERE user_id=?", (uid,))
+        return c.fetchone() is not None
+
+
+def add_admin(uid, added_by):
+    with get_conn() as conn:
+        try:
+            conn.execute("INSERT INTO admins (user_id, added_by) VALUES (?,?)", (uid, added_by))
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def remove_admin(uid):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        return c.rowcount > 0
+
+
+def get_all_admins():
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM admins ORDER BY added_at DESC")
+        return [dict(r) for r in c.fetchall()]
+
+
+# ─── Actor helpers ───
+def add_actor(name, role, rarity, known_for="", file_id=None, image_url=None, description=""):
+    src = "file_id" if file_id else "url"
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""INSERT INTO actors (name, role, rarity, known_for,
+            file_id, image_url, image_source, description)
+            VALUES (?,?,?,?,?,?,?,?)""",
+            (name, role, rarity, known_for, file_id, image_url, src, description))
+        return c.lastrowid
+
+
+def get_actor(aid):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM actors WHERE id=?", (aid,))
+        row = c.fetchone()
+        return dict(row) if row else None
+
+
+def get_random_actor():
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM actors WHERE active=1 ORDER BY RANDOM() LIMIT 1")
+        row = c.fetchone()
+        return dict(row) if row else None
+
+
+def get_all_actors():
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM actors WHERE active=1 ORDER BY id DESC")
+        return [dict(r) for r in c.fetchall()]
+
+
+def delete_actor(aid):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE actors SET active=0 WHERE id=?", (aid,))
+
+
+def count_actor_owners(aid):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM user_actors WHERE actor_id=?", (aid,))
+        return c.fetchone()[0]
+
+
+def give_actor_to_user(user_id, actor_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO user_actors (user_id, actor_id) VALUES (?,?)",
+                  (user_id, actor_id))
+
+
+def count_user_actors(uid):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM user_actors WHERE user_id=?", (uid,))
+        return c.fetchone()[0]
+
+
+def get_user_actors_grouped(uid):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT a.id AS actor_id, a.name, a.role, a.rarity, a.known_for,
+            a.file_id, a.image_url, a.image_source, a.description,
+            COUNT(ua.id) AS user_dup_count
+            FROM user_actors ua JOIN actors a ON ua.actor_id = a.id
+            WHERE ua.user_id=?
+            GROUP BY a.id
+            ORDER BY a.rarity, a.name""", (uid,))
+        rows = [dict(r) for r in c.fetchall()]
+    grouped = {}
+    for r in rows:
+        key = r.get("rarity") or "Supporting"
+        grouped.setdefault(key, []).append(r)
+    return grouped
+
+
+def get_user_rarity_counts(uid):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT a.rarity, COUNT(*) AS cnt FROM user_actors ua
+            JOIN actors a ON ua.actor_id = a.id WHERE ua.user_id=?
+            GROUP BY a.rarity""", (uid,))
+        return {r["rarity"]: r["cnt"] for r in c.fetchall()}
+
+
+def count_user_dups(uid, actor_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM user_actors WHERE user_id=? AND actor_id=?",
+                  (uid, actor_id))
+        return c.fetchone()[0]
+
+
+# ─── Spawns ───
+def create_spawn(chat_id, actor_id, expires_at):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""INSERT INTO spawns (chat_id, actor_id, expires_at)
+                     VALUES (?,?,?)""", (chat_id, actor_id, expires_at))
+        return c.lastrowid
+
+
+def set_spawn_message(sid, mid):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE spawns SET message_id=? WHERE id=?", (mid, sid))
+
+
+def get_active_spawn(chat_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT * FROM spawns WHERE chat_id=? AND status='active'
+                     ORDER BY id DESC LIMIT 1""", (chat_id,))
+        row = c.fetchone()
+        return dict(row) if row else None
+
+
+def try_grab_spawn(spawn_id, user_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""UPDATE spawns SET status='grabbed', grabbed_by=?
+                     WHERE id=? AND status='active'""", (user_id, spawn_id))
+        if c.rowcount != 1:
+            return False
+        c.execute("""INSERT INTO user_actors (user_id, actor_id)
+                     SELECT ?, actor_id FROM spawns WHERE id=?""",
+                  (user_id, spawn_id))
+        return True
+
+
+def expire_spawns():
+    now = _now().isoformat()
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""UPDATE spawns SET status='expired'
+                     WHERE status='active' AND expires_at<?""", (now,))
+        return c.rowcount
+
+
+def get_expired_spawns_with_msg():
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT id, chat_id, message_id FROM spawns
+                     WHERE status='expired' AND message_id IS NOT NULL""")
+        return [dict(r) for r in c.fetchall()]
+
+
+def clear_spawn_message(sid):
+    with get_conn() as conn:
+        conn.execute("UPDATE spawns SET message_id=NULL WHERE id=?", (sid,))
+
+
+def incr_msg(chat_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT msg_count FROM group_counters WHERE chat_id=?", (chat_id,))
+        row = c.fetchone()
+        if not row:
+            c.execute("INSERT INTO group_counters (chat_id, msg_count) VALUES (?,1)", (chat_id,))
+            return 1
+        nc = row["msg_count"] + 1
+        c.execute("UPDATE group_counters SET msg_count=? WHERE chat_id=?", (nc, chat_id))
+        return nc
+
+
+def reset_msg(chat_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""UPDATE group_counters SET msg_count=0,
+                     total_spawns=total_spawns+1,
+                     last_spawn=CURRENT_TIMESTAMP WHERE chat_id=?""", (chat_id,))
+
+
+# ═══════════════ RARITIES ═══════════════
+RARITY_EMOJI = {
+    "Extra":"⚪","Side":"🟢","Supporting":"🔵","Main Cast":"🟣",
+    "Second Lead":"🟠","Male Lead":"🔴","Female Lead":"💖",
+    "Iconic":"🌟","Legendary":"👑","Award Winner":"🏆",
+    "Hallyu King":"💎","Hallyu Queen":"💍",
+}
+RARITY_ORDER = list(RARITY_EMOJI.keys())
+def role_emoji(r): return "👨" if r == "actor" else "👩"
+def role_label(r): return "Actor" if r == "actor" else "Actress"
+
+
+# ═══════════════ HEALTH SERVER ═══════════════
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            up = int(time.time() - BOT_START_TIME)
+            self.wfile.write(f'{{"status":"ok","uptime":{up}}}'.encode())
+        else:
+            self.send_response(404); self.end_headers()
+    def log_message(self, *a, **k): pass
+
+
+def start_health_server():
+    try:
+        srv = HTTPServer(("0.0.0.0", PORT), _HealthHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log.info(f"Health server on :{PORT}")
+    except Exception as e:
+        log.warning(f"health skipped: {e}")
+
+
+# ═══════════════ HELPERS ═══════════════
+async def is_joined(bot, uid):
+    for ch, _ in REQUIRED_CHANNELS:
+        try:
+            m = await bot.get_chat_member(ch, uid)
+            if m.status not in ("creator", "administrator", "member", "restricted"):
+                return False, f"You have not joined {ch}"
+        except Exception as e:
+            log.error(f"force-join {ch}: {e}")
+            return False, f"Bot is not admin in {ch}"
+    return True, "OK"
+
+
+def kb_join():
+    rows = [[InlineKeyboardButton(f"📢 {ch}", url=url)] for ch, url in REQUIRED_CHANNELS]
+    rows.append([InlineKeyboardButton("✅ I've Joined", callback_data="check_join")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_start_main():
+    """Start message buttons — 2 rows."""
+    add_link = f"https://t.me/{BOT_USERNAME}?startgroup=true"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ ➕ ᴀᴅᴅ ᴍᴇ ᴛᴏ ʏᴏᴜʀ ɢᴄ ➕ ➕", url=add_link)],
+        [
+            InlineKeyboardButton("❓ ʜᴇʟᴘ", callback_data="ui:help"),
+            InlineKeyboardButton("👑 ᴏᴡɴᴇʀ", url=f"https://t.me/{OWNER_USERNAME}"),
+        ],
+    ])
+
+
+def kb_help_back():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔙 ʙᴀᴄᴋ", callback_data="ui:back")
+    ]])
+
+
+# ═══════════════ TEXTS ═══════════════
+START_TEXT = (
+    "🇰🇷🎬 <b>KOREAN GUESS BOT</b> 🎬🇰🇷\n\n"
+    "👋 <b>Welcome, K-Drama Fans!</b>\n\n"
+    "🖼️ Look at the image\n"
+    "🤔 Guess the <b>actor / actress</b>\n"
+    "🎯 Give the correct answer &amp; earn points!\n\n"
+    "🏆 Climb the leaderboard!\n"
+    "🔥 Let's see who knows K-Dramas best!\n\n"
+    "👇 <b>Ready? Let's Guess!</b> 🎮\n\n"
+    "💙 <i>Powered by Abyss Dimension</i>"
+)
+
+HELP_TEXT = (
+    f"🎬 <b>{small_caps('Korean Guess Bot')}</b> 🎬\n\n"
+    f"<b>── {small_caps('Commands')} ──</b>\n\n"
+    "🇰🇷 <code>/start</code> — Main menu\n"
+    "❓ <code>/help</code> — Ye help\n"
+    "📦 <code>/collection</code> — Apna collection\n"
+    "🎯 <code>/guess &lt;name&gt;</code> — Spawn ko catch karo\n"
+    "💰 <code>/daily</code> — 100 coins (24h)\n"
+    "💰 <code>/weekly</code> — 2000 coins (7d)\n\n"
+    f"<b>── {small_caps('How To Play')} ──</b>\n\n"
+    f"1️⃣ {small_caps('Every')} 100 {small_caps('messages')} — {small_caps('an actor/actress spawns')}\n"
+    f"2️⃣ {small_caps('Look at the image')}\n"
+    f"3️⃣ <code>/guess &lt;name&gt;</code> {small_caps('to catch')}\n"
+    f"4️⃣ {small_caps('Open')} /collection {small_caps('to view your harem')}\n\n"
+    "💙 <i>Powered by Abyss Dimension</i>"
+)
+
+OHELP_TEXT = (
+    f"🛠 <b>{small_caps('Admin Panel')}</b>\n\n"
+    f"<b>── {small_caps('Add Actor / Actress')} ──</b>\n\n"
+    "▫️ <code>/addactor</code> — New actor/actress add karo\n"
+    "   ├─ 📸 Image\n"
+    "   ├─ 📝 Name\n"
+    "   ├─ 👨 Actor / 👩 Actress\n"
+    "   ├─ ⭐ Rarity\n"
+    "   └─ 📺 Known for (drama name)\n\n"
+    f"<b>── {small_caps('Manage')} ──</b>\n\n"
+    "▫️ <code>/actorlist</code> — Saare actors\n"
+    "▫️ <code>/delactor &lt;id&gt;</code> — Delete\n"
+    "▫️ <code>/status</code> — Stats\n"
+    "▫️ <code>/backup</code> — DB backup\n\n"
+    f"<b>── {small_caps('Admins')} ──</b>\n\n"
+    "▫️ <code>/addadmin</code> / <code>/removeadmin</code> / <code>/admins</code>"
+)
+
+
+# ═══════════════ UI HANDLERS ═══════════════
+async def cmd_start(update, context):
+    u = update.effective_user
+    try: get_or_create_player(u.id, u.username, u.first_name)
+    except Exception: pass
+
+    # Owner bypass
+    if u.id == OWNER_ID:
+        kb = kb_start_main()
+    else:
+        ok, _ = await is_joined(context.bot, u.id)
+        if not ok:
+            await update.message.reply_text(
+                f"🔒 <b>Pehle dono channels join karo!</b>\n\n"
+                f"<i>Join both, then tap 'I've Joined'.</i>",
+                parse_mode="HTML", reply_markup=kb_join())
+            return
+        kb = kb_start_main()
+
+    try:
+        await update.message.reply_photo(
+            photo=START_PHOTO, caption=START_TEXT,
+            parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        try:
+            await update.message.reply_text(
+                START_TEXT, parse_mode="HTML", reply_markup=kb)
+        except Exception: pass
+
+
+async def cb_ui(update, context):
+    q = update.callback_query
+    data = q.data or ""
+    await q.answer()
+
+    if data == "ui:help":
+        try:
+            if q.message.caption is not None:
+                await q.edit_message_caption(caption=HELP_TEXT,
+                    parse_mode="HTML", reply_markup=kb_help_back())
+            else:
+                await q.edit_message_text(HELP_TEXT,
+                    parse_mode="HTML", reply_markup=kb_help_back())
+        except Exception as e:
+            log.warning(f"help edit: {e}")
+        return
+
+    if data == "ui:back":
+        try:
+            if q.message.caption is not None:
+                await q.edit_message_caption(caption=START_TEXT,
+                    parse_mode="HTML", reply_markup=kb_start_main())
+            else:
+                await q.edit_message_text(START_TEXT,
+                    parse_mode="HTML", reply_markup=kb_start_main())
+        except Exception as e:
+            log.warning(f"back edit: {e}")
+        return
+
+    if data == "check_join":
+        ok, reason = await is_joined(context.bot, q.from_user.id)
+        if ok:
+            await q.answer("✅ Verified!", show_alert=True)
+            try:
+                await q.edit_message_text(
+                    "🟢 <b>Verified!</b> Use /start to begin.",
+                    parse_mode="HTML")
+            except Exception: pass
+        else:
+            await q.answer(f"❌ {reason}", show_alert=True)
+        return
+
+
+async def cmd_help(update, context):
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML",
+                                    reply_markup=kb_help_back())
+
+
+async def cmd_ohelp(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 <b>Not Authorized.</b>", parse_mode="HTML")
+        return
+    await update.message.reply_text(OHELP_TEXT, parse_mode="HTML")
+
+
+# ═══════════════ /guess — catch spawn ═══════════════
+async def cmd_guess(update, context):
+    chat = update.effective_chat
+    u = update.effective_user
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("❌ Group me hi chalti hai.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "❌ Usage: <code>/guess &lt;name&gt;</code>", parse_mode="HTML"); return
+
+    user_input = " ".join(context.args).strip().lower()
+    active = get_active_spawn(chat.id)
+    if not active:
+        await update.message.reply_text("🌑 Koi spawn nahi hai abhi.")
+        return
+
+    actor = get_actor(active["actor_id"])
+    if not actor:
+        await update.message.reply_text("❌ Character missing.")
+        return
+
+    correct = (actor.get("name") or "").strip().lower()
+    matched = (user_input == correct)
+    if not matched and len(user_input) >= 3:
+        cw = correct.split(); uw = user_input.split()
+        if len(cw) >= 2:
+            for w in uw:
+                if len(w) >= 3 and w in cw:
+                    matched = True; break
+
+    if not matched:
+        await update.message.reply_text("❌ Galat! Try again.")
+        return
+
+    if not try_grab_spawn(active["id"], u.id):
+        await update.message.reply_text("⚡ Koi aur pehle le gaya.")
+        return
+
+    try: get_or_create_player(u.id, u.username, u.first_name)
+    except Exception: pass
+
+    add_coins(u.id, GUESS_REWARD_COINS)
+    add_points(u.id, 1)
+
+    rarity = actor.get("rarity", "Supporting")
+    re = RARITY_EMOJI.get(rarity, "⚪")
+    ge = role_emoji(actor.get("role", "actor"))
+    name = actor.get("name") or "?"
+    total = count_user_actors(u.id)
+    coins = get_coins(u.id)
+    points = get_points(u.id)
+
+    cap = (
+        f"✨ <b>{small_caps('Correct Guess')}</b>\n\n"
+        f"{ge} <b>{name}</b>\n"
+        f"⭐ {re} <b>{rarity}</b>\n"
+        f"👤 <code>{u.id}</code>\n\n"
+        f"💰 +{GUESS_REWARD_COINS} coins (total <b>{coins}</b>)\n"
+        f"🏆 Points: <b>{points}</b>  |  📦 Collection: <b>{total}</b>"
+    )
+    photo = actor["image_url"] if actor["image_source"] == "url" else actor["file_id"]
+    try:
+        await context.bot.send_photo(chat.id, photo, caption=cap, parse_mode="HTML")
+    except Exception:
+        await update.message.reply_text(cap, parse_mode="HTML")
+
+
+# ═══════════════ /collection ═══════════════
+async def cmd_collection(update, context):
+    u = update.effective_user
+    ok, reason = await is_joined(context.bot, u.id)
+    if not ok:
+        await update.message.reply_text(
+            f"🔒 <b>Join both channels first.</b>\n\n⚠️ {reason}",
+            parse_mode="HTML", reply_markup=kb_join()); return
+
+    total = count_user_actors(u.id)
+    if total == 0:
+        await update.message.reply_text(
+            "🌑 <b>Collection khaali hai.</b>\n\n"
+            "Group me 100 messages wait karo, spawn hoga, phir /guess karo.",
+            parse_mode="HTML"); return
+
+    grouped = get_user_actors_grouped(u.id)
+    rc = get_user_rarity_counts(u.id)
+    coins = get_coins(u.id); points = get_points(u.id)
+
+    lines = [
+        f"📦 <b>{small_caps('Collection')} — {u.first_name or 'Hunter'}</b>",
+        f"💰 Coins: <b>{coins}</b>  |  🏆 Points: <b>{points}</b>",
+        f"🌸 Total: <b>{total}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for r in RARITY_ORDER:
+        if r in rc:
+            lines.append(f"{RARITY_EMOJI.get(r,'⚪')} <b>{r}</b>: {rc[r]}")
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    for r in RARITY_ORDER:
+        if r in grouped:
+            lines.append(f"{RARITY_EMOJI.get(r,'⚪')} <b>{r}</b>")
+            for a in grouped[r][:8]:
+                ge = role_emoji(a.get("role","actor"))
+                dup = a.get("user_dup_count", 1)
+                lines.append(f"   {ge} <code>{a['actor_id']}</code> {a['name']} (x{dup})")
+            if len(grouped[r]) > 8:
+                lines.append(f"   <i>… +{len(grouped[r])-8} more</i>")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ═══════════════ Daily / Weekly ═══════════════
+async def cmd_daily(update, context):
+    u = update.effective_user
+    p = get_or_create_player(u.id, u.username, u.first_name)
+    last = _parse_dt(p.get("last_daily")); now = _now()
+    if last and (now - last) < DAILY_COOLDOWN:
+        left = DAILY_COOLDOWN - (now - last)
+        h, rem = divmod(int(left.total_seconds()), 3600); m = rem // 60
+        await update.message.reply_text(
+            f"⏳ <b>Daily already claimed</b>\n"
+            f"Come back in <b>{h}h {m}m</b>\n"
+            f"Balance: <code>{get_coins(u.id)}</code>",
+            parse_mode="HTML"); return
+    add_coins(u.id, DAILY_COINS)
+    with get_conn() as conn:
+        conn.execute("UPDATE players SET last_daily=? WHERE user_id=?",
+                     (now.isoformat(), u.id))
+    await update.message.reply_text(
+        f"✅ <b>Daily claimed</b>\n💰 +{DAILY_COINS} coins\n"
+        f"💼 Balance: <b>{get_coins(u.id)}</b>\n⏰ Next in 24h",
+        parse_mode="HTML")
+
+
+async def cmd_weekly(update, context):
+    u = update.effective_user
+    p = get_or_create_player(u.id, u.username, u.first_name)
+    last = _parse_dt(p.get("last_weekly")); now = _now()
+    if last and (now - last) < WEEKLY_COOLDOWN:
+        left = WEEKLY_COOLDOWN - (now - last)
+        d = left.days; h = left.seconds // 3600
+        await update.message.reply_text(
+            f"⏳ <b>Weekly already claimed</b>\n"
+            f"Come back in <b>{d}d {h}h</b>\n"
+            f"Balance: <code>{get_coins(u.id)}</code>",
+            parse_mode="HTML"); return
+    add_coins(u.id, WEEKLY_COINS)
+    with get_conn() as conn:
+        conn.execute("UPDATE players SET last_weekly=? WHERE user_id=?",
+                     (now.isoformat(), u.id))
+    await update.message.reply_text(
+        f"✅ <b>Weekly claimed</b>\n💰 +{WEEKLY_COINS} coins\n"
+        f"💼 Balance: <b>{get_coins(u.id)}</b>\n⏰ Next in 7 days",
+        parse_mode="HTML")
+
+
+# ═══════════════ SPAWN ═══════════════
+async def track_message(update, context):
+    if update.effective_chat.type not in ("group","supergroup"): return
+    if not update.effective_user or update.effective_user.is_bot: return
+    chat_id = update.effective_chat.id
+    if get_active_spawn(chat_id): return
+    count = incr_msg(chat_id)
+    if count >= SPAWN_MESSAGE_THRESHOLD:
+        reset_msg(chat_id)
+        await spawn_actor(chat_id, context)
+
+
+async def spawn_actor(chat_id, context):
+    a = get_random_actor()
+    if not a: return
+    exp = (_now() + timedelta(seconds=SPAWN_EXPIRY_SECONDS)).isoformat()
+    sid = create_spawn(chat_id, a["id"], exp)
+    cap = (
+        f"🇰🇷 <b>{small_caps('Actor/Actress Has Appeared')}</b>\n"
+        f"Type <code>/guess &lt;name&gt;</code> {small_caps('to catch')}"
+    )
+    photo = a["image_url"] if a["image_source"] == "url" else a["file_id"]
+    try:
+        msg = await context.bot.send_photo(chat_id=chat_id, photo=photo,
+                                            caption=cap, parse_mode="HTML")
+        set_spawn_message(sid, msg.message_id)
+    except Exception as e:
+        log.error(f"spawn fail: {e}")
+
+
+async def expire_job(context):
+    n = expire_spawns()
+    if n: log.info(f"expired {n} spawns")
+    rows = get_expired_spawns_with_msg()
+    for r in rows:
+        try:
+            await context.bot.delete_message(chat_id=r["chat_id"], message_id=r["message_id"])
+        except Exception: pass
+        finally: clear_spawn_message(r["id"])
+    if rows:
+        log.info(f"deleted {len(rows)} expired spawn msgs")
+
+
+# ═══════════════ ADMIN: add actor flow ═══════════════
+ASK_PHOTO, ASK_NAME, ASK_ROLE, ASK_RARITY, ASK_KNOWN_FOR = range(5)
+
+
+def _kb_role():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("👨 ᴀᴄᴛᴏʀ", callback_data="arole:actor"),
+        InlineKeyboardButton("👩 ᴀᴄᴛʀᴇss", callback_data="arole:actress"),
+    ]])
+
+
+def _kb_rarity():
+    buttons = []; row = []
+    for r, e in RARITY_EMOJI.items():
+        row.append(InlineKeyboardButton(f"{e} {r}", callback_data=f"arar:{r}"))
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row: buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+async def addactor_start(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only.")
+        return ConversationHandler.END
+    context.user_data.clear()
+    await update.message.reply_text("📸 Actor/Actress ki image bhej (photo / file / URL).")
+    return ASK_PHOTO
+
+
+async def addactor_photo(update, context):
+    fid = url = None
+    if update.message.photo:
+        fid = update.message.photo[-1].file_id
+    elif update.message.document and update.message.document.mime_type and \
+         update.message.document.mime_type.startswith("image/"):
+        fid = update.message.document.file_id
+    elif update.message.text and update.message.text.startswith(("http://","https://")):
+        url = update.message.text.strip()
+    else:
+        await update.message.reply_text("❌ Photo / image file / URL bhej."); return ASK_PHOTO
+    context.user_data["file_id"] = fid
+    context.user_data["image_url"] = url
+    await update.message.reply_text("📝 Actor/Actress ka naam bhej.")
+    return ASK_NAME
+
+
+async def addactor_name(update, context):
+    if not update.message.text:
+        await update.message.reply_text("❌ Text bhej."); return ASK_NAME
+    name = update.message.text.strip()
+    if not name or len(name) > 80:
+        await update.message.reply_text("❌ 1-80 chars."); return ASK_NAME
+    context.user_data["name"] = name
+    await update.message.reply_text(
+        f"👤 <b>{name}</b>\n\nActor ya Actress?",
+        parse_mode="HTML", reply_markup=_kb_role())
+    return ASK_ROLE
+
+
+async def addactor_role_cb(update, context):
+    q = update.callback_query; await q.answer()
+    r = q.data.split(":")[1]
+    context.user_data["role"] = r
+    await q.edit_message_text(f"Role: {role_label(r)}\n\n⭐ Rarity chuno:", reply_markup=_kb_rarity())
+    return ASK_RARITY
+
+
+async def addactor_role_txt(update, context):
+    if not update.message.text: return ASK_ROLE
+    r = update.message.text.strip().lower()
+    if r not in ("actor","actress"):
+        await update.message.reply_text("❌ 'actor' ya 'actress'."); return ASK_ROLE
+    context.user_data["role"] = r
+    await update.message.reply_text(f"Role: {role_label(r)}\n\n⭐ Rarity:",
+                                    reply_markup=_kb_rarity())
+    return ASK_RARITY
+
+
+async def addactor_rarity_cb(update, context):
+    q = update.callback_query; await q.answer()
+    r = q.data.split(":",1)[1]
+    if r not in RARITY_EMOJI:
+        await q.answer("Invalid!", show_alert=True); return ASK_RARITY
+    context.user_data["rarity"] = r
+    await q.edit_message_text(
+        f"Rarity: {RARITY_EMOJI.get(r,'⚪')} {r}\n\n📺 Kis drama ke liye famous? (naam likho)",
+        parse_mode="HTML")
+    return ASK_KNOWN_FOR
+
+
+async def addactor_rarity_txt(update, context):
+    if not update.message.text: return ASK_RARITY
+    r = update.message.text.strip()
+    for k in RARITY_EMOJI:
+        if k.lower() == r.lower(): r = k; break
+    else:
+        await update.message.reply_text("❌ Invalid rarity. Button use kar."); return ASK_RARITY
+    context.user_data["rarity"] = r
+    await update.message.reply_text(
+        f"Rarity: {RARITY_EMOJI.get(r,'⚪')} {r}\n\n📺 Kis drama ke liye famous?",
+        parse_mode="HTML")
+    return ASK_KNOWN_FOR
+
+
+async def addactor_known_for(update, context):
+    if not update.message.text:
+        await update.message.reply_text("❌ Text bhej (ya 'skip')."); return ASK_KNOWN_FOR
+    kf = update.message.text.strip()
+    if kf.lower() == "skip": kf = ""
+    if len(kf) > 100:
+        await update.message.reply_text("❌ 100 chars tak."); return ASK_KNOWN_FOR
+    context.user_data["known_for"] = kf
+
+    d = context.user_data
+    aid = add_actor(
+        name=d.get("name",""), role=d.get("role","actor"),
+        rarity=d.get("rarity","Supporting"), known_for=kf,
+        file_id=d.get("file_id"), image_url=d.get("image_url"))
+    photo = d.get("image_url") or d.get("file_id")
+    re = RARITY_EMOJI.get(d.get("rarity","Supporting"), "⚪")
+    ge = role_emoji(d.get("role","actor"))
+
+    cap = (
+        f"✅ <b>{small_caps('Added')}</b>\n\n"
+        f"🆔 <code>{aid}</code>\n"
+        f"{ge} <b>{d.get('name')}</b>\n"
+        f"⭐ {re} {d.get('rarity')}\n"
+        f"📺 {kf or '—'}"
+    )
+    try:
+        await update.message.reply_photo(photo, caption=cap, parse_mode="HTML")
+    except Exception:
+        await update.message.reply_text(cap, parse_mode="HTML")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def addactor_cancel(update, context):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
+
+
+# ═══════════════ ADMIN commands ═══════════════
+async def cmd_actorlist(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return
+    ws = get_all_actors()
+    if not ws:
+        await update.message.reply_text("📭 None."); return
+    txt = f"👥 <b>Actors/Actresses ({len(ws)})</b>\n\n"
+    for w in ws[:40]:
+        re = RARITY_EMOJI.get(w.get("rarity","Supporting"), "⚪")
+        ge = role_emoji(w.get("role","actor"))
+        txt += f"<code>{w['id']}</code> {ge}{re} {w.get('name','?')} — {w.get('known_for','')}\n"
+    if len(ws) > 40:
+        txt += f"\n<i>...and {len(ws)-40} more</i>"
+    await update.message.reply_text(txt, parse_mode="HTML")
+
+
+async def cmd_delactor(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return
+    if not context.args:
+        await update.message.reply_text("📌 /delactor <id>"); return
+    try: aid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid."); return
+    if not get_actor(aid):
+        await update.message.reply_text(f"❌ ID {aid} not found."); return
+    delete_actor(aid)
+    await update.message.reply_text(f"✅ Deleted ID {aid}")
+
+
+async def cmd_status(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM actors WHERE active=1"); total = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM user_actors"); grabbed = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM players"); users = c.fetchone()[0]
+    await update.message.reply_text(
+        f"🗄️ <b>STATUS</b>\n\n👥 Actors: <b>{total}</b>\n"
+        f"🎯 Grabs: <b>{grabbed}</b>\n👤 Players: <b>{users}</b>",
+        parse_mode="HTML")
+
+
+async def cmd_backup(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return
+    if not os.path.exists(DB_PATH):
+        await update.message.reply_text("❌ DB not found."); return
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dst = os.path.join(BACKUP_DIR, f"kdrama_{stamp}.db")
+        shutil.copy2(DB_PATH, dst)
+        kb = os.path.getsize(dst) // 1024
+        await update.message.reply_document(
+            document=open(dst, "rb"), filename=f"kdrama_{stamp}.db",
+            caption=f"💾 Backup: {kb} KB")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fail: {e}")
+
+
+async def cmd_addadmin(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Owner only."); return
+    tid = None
+    if update.message.reply_to_message:
+        tid = update.message.reply_to_message.from_user.id
+    elif context.args:
+        try: tid = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid ID."); return
+    if not tid:
+        await update.message.reply_text("📌 Reply or give ID."); return
+    if tid == OWNER_ID:
+        await update.message.reply_text("❌ Owner already admin."); return
+    if add_admin(tid, update.effective_user.id):
+        await update.message.reply_text(f"✅ Admin added: {tid}")
+    else:
+        await update.message.reply_text("⚠️ Already admin.")
+
+
+async def cmd_removeadmin(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Owner only."); return
+    tid = None
+    if update.message.reply_to_message:
+        tid = update.message.reply_to_message.from_user.id
+    elif context.args:
+        try: tid = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid."); return
+    if tid and remove_admin(tid):
+        await update.message.reply_text(f"✅ Removed: {tid}")
+    else:
+        await update.message.reply_text("⚠️ Not an admin.")
+
+
+async def cmd_admins(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Owner only."); return
+    admins = get_all_admins()
+    txt = f"👑 <b>ADMINS</b>\n\nOwner: <code>{OWNER_ID}</code>\n\n"
+    for a in admins: txt += f"▫️ <code>{a['user_id']}</code>\n"
+    if not admins: txt += "📭 None."
+    await update.message.reply_text(txt, parse_mode="HTML")
+
+
+# ═══════════════ MAIN ═══════════════
+def main():
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN missing"); return
+    if not OWNER_ID:
+        print("❌ OWNER_ID missing"); return
+
+    _auto_backup()
+    init_db()
+    start_health_server()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # addactor conversation
+    addactor_conv = ConversationHandler(
+        entry_points=[CommandHandler("addactor", addactor_start)],
+        states={
+            ASK_PHOTO:      [MessageHandler(filters.PHOTO | filters.Document.IMAGE |
+                                             (filters.TEXT & ~filters.COMMAND), addactor_photo)],
+            ASK_NAME:       [MessageHandler(filters.TEXT & ~filters.COMMAND, addactor_name)],
+            ASK_ROLE:       [CallbackQueryHandler(addactor_role_cb, pattern=r"^arole:"),
+                             MessageHandler(filters.TEXT & ~filters.COMMAND, addactor_role_txt)],
+            ASK_RARITY:     [CallbackQueryHandler(addactor_rarity_cb, pattern=r"^arar:"),
+                             MessageHandler(filters.TEXT & ~filters.COMMAND, addactor_rarity_txt)],
+            ASK_KNOWN_FOR:  [MessageHandler(filters.TEXT & ~filters.COMMAND, addactor_known_for)],
+        },
+        fallbacks=[CommandHandler("cancel", addactor_cancel)],
+        per_user=True, per_chat=False,
+    )
+    app.add_handler(addactor_conv, group=0)
+
+    # public commands
+    app.add_handler(CommandHandler("start", cmd_start), group=0)
+    app.add_handler(CommandHandler("help", cmd_help), group=0)
+    app.add_handler(CommandHandler("collection", cmd_collection), group=0)
+    app.add_handler(CommandHandler("guess", cmd_guess), group=0)
+    app.add_handler(CommandHandler("daily", cmd_daily), group=0)
+    app.add_handler(CommandHandler("weekly", cmd_weekly), group=0)
+
+    # admin
+    app.add_handler(CommandHandler("ohelp", cmd_ohelp), group=0)
+    app.add_handler(CommandHandler("actorlist", cmd_actorlist), group=0)
+    app.add_handler(CommandHandler("delactor", cmd_delactor), group=0)
+    app.add_handler(CommandHandler("status", cmd_status), group=0)
+    app.add_handler(CommandHandler("backup", cmd_backup), group=0)
+    app.add_handler(CommandHandler("addadmin", cmd_addadmin), group=0)
+    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin), group=0)
+    app.add_handler(CommandHandler("admins", cmd_admins), group=0)
+
+    app.add_handler(CallbackQueryHandler(cb_ui, pattern=r"^ui:|^check_join$"), group=0)
+
+    # tracker (last)
+    app.add_handler(MessageHandler(
+        (filters.TEXT | filters.PHOTO | filters.Sticker.ALL) & ~filters.COMMAND,
+        track_message), group=10)
+
+    if app.job_queue:
+        app.job_queue.run_repeating(expire_job, interval=30, first=10)
+
+    log.info("Korean Guess Bot v1 starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()

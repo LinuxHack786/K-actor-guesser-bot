@@ -1,0 +1,2002 @@
+# kdramabot.py — Korean Actor/Actress Guess Bot v3
+# target: Python 3.11 · python-telegram-bot 21.x · Pillow 10+ · requests
+import os, io, time, math, shutil, random, sqlite3, logging, threading, json, asyncio
+from contextlib import contextmanager
+from datetime import datetime, timezone, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import requests
+import httpx
+from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup,
+                      InlineQueryResultPhoto, InlineQueryResultCachedPhoto,
+                      InlineQueryResultArticle, InputTextMessageContent,
+                      InputMediaPhoto)
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
+                          MessageHandler, ConversationHandler, InlineQueryHandler,
+                          ChosenInlineResultHandler, filters, ContextTypes)
+
+load_dotenv()
+
+BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
+BOT_USERNAME   = os.getenv("BOT_USERNAME", "YourKDramaBot")
+OWNER_ID       = int(os.getenv("OWNER_ID", "0"))
+OWNER_USERNAME = os.getenv("OWNER_USERNAME", "II_DEMONS_SHADOW_II")
+SUPPORT_LINK   = os.getenv("SUPPORT_LINK", "https://t.me/Demon_persnality")
+SUPPORT_NAME   = os.getenv("SUPPORT_NAME", "Demon Personality")
+DB_PATH        = os.getenv("DB_PATH", "kdrama.db")
+LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
+PORT           = int(os.getenv("PORT", "8080"))
+HEALTH_HOST    = os.getenv("HEALTH_HOST", "0.0.0.0")
+
+BOT_START_TIME = time.time()
+START_PHOTO    = os.getenv("START_PHOTO",
+    "https://i.ibb.co/27mjv5rg/file-000000001c6c82439c0c067284214fdd.png")
+
+REQUIRED_CHANNELS = [
+    ("@Abyss_diemension_Animes", "https://t.me/Abyss_diemension_Animes"),
+    ("@Abyss_kdrama_main_channel", "https://t.me/Abyss_kdrama_main_channel"),
+]
+
+SPAWN_MESSAGE_THRESHOLD = 100
+SPAWN_EXPIRY_SECONDS    = 600
+GUESS_REWARD_COINS      = 50
+
+DAILY_COINS     = 100
+WEEKLY_COINS    = 2000
+DAILY_COOLDOWN  = timedelta(hours=24)
+WEEKLY_COOLDOWN = timedelta(days=7)
+CLAIM_COOLDOWN  = timedelta(hours=24)
+
+BACKUP_DIR  = "backups"
+BACKUP_KEEP = 10
+TELEGRAPH_DELAY = 1.2
+ACTOR_CACHE_TTL = 60
+
+# Spam filter
+SPAM_WINDOW = 120       # 2 minutes
+SPAM_LIMIT  = 15        # messages per window
+
+CLAIM_WEIGHTS = {
+    "Extra":50, "Side":40, "Supporting":30, "Main Cast":15,
+    "Second Lead":12, "Male Lead":8, "Female Lead":8,
+    "Iconic":5, "Legendary":3, "Award Winner":2,
+    "Hallyu King":1, "Hallyu Queen":1,
+}
+
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("kdrama_bot")
+
+STATUS = {"bot_ready": False, "last_spawn_ts": None, "last_error": None}
+
+_ACTOR_CACHE = {"ids": [], "rarities": {}, "ts": 0}
+_CACHE_LOCK = threading.Lock()
+
+_SPAM_TRACK = {}   # {(chat_id, user_id): [timestamps]}
+_SPAM_LOCK = threading.Lock()
+
+
+# ═══════════════ FONTS ═══════════════
+_SMALL_CAPS = {
+    "a":"ᴀ","b":"ʙ","c":"ᴄ","d":"ᴅ","e":"ᴇ","f":"ꜰ","g":"ɢ","h":"ʜ","i":"ɪ","j":"ᴊ",
+    "k":"ᴋ","l":"ʟ","m":"ᴍ","n":"ɴ","o":"ᴏ","p":"ᴘ","q":"ǫ","r":"ʀ","s":"ꜱ","t":"ᴛ",
+    "u":"ᴜ","v":"ᴠ","w":"ᴡ","x":"x","y":"ʏ","z":"ᴢ",
+}
+def sc(t): return "".join(_SMALL_CAPS.get(c.lower(), c) for c in t)
+
+def bi(t):
+    o = []
+    for ch in t:
+        if "A" <= ch <= "Z": o.append(chr(0x1D468 + ord(ch) - ord("A")))
+        elif "a" <= ch <= "z": o.append(chr(0x1D482 + ord(ch) - ord("a")))
+        else: o.append(ch)
+    return "".join(o)
+
+def bold(t):
+    o = []
+    for ch in t:
+        if "A" <= ch <= "Z": o.append(chr(0x1D400 + ord(ch) - ord("A")))
+        elif "a" <= ch <= "z": o.append(chr(0x1D41A + ord(ch) - ord("a")))
+        elif "0" <= ch <= "9": o.append(chr(0x1D7CE + ord(ch) - ord("0")))
+        else: o.append(ch)
+    return "".join(o)
+
+
+# ═══════════════ DB ═══════════════
+_db_local = threading.local()
+
+def _conn():
+    conn = getattr(_db_local, "conn", None)
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-64000")
+        conn.execute("PRAGMA mmap_size=268435456")
+        _db_local.conn = conn
+    return conn
+
+@contextmanager
+def get_conn():
+    conn = _conn()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback(); raise
+
+
+def db_integrity_check():
+    try:
+        c = _conn().cursor()
+        c.execute("PRAGMA integrity_check")
+        row = c.fetchone()
+        return (row[0] == "ok" if row else False), (row[0] if row else "unknown")
+    except Exception as e:
+        return False, str(e)
+
+
+def _auto_backup():
+    if not os.path.exists(DB_PATH): return
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dst = os.path.join(BACKUP_DIR, f"kdrama_{stamp}.db")
+        shutil.copy2(DB_PATH, dst)
+        log.info(f"Auto-backup: {dst}")
+        files = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("kdrama_")])
+        for f in files[:-BACKUP_KEEP]:
+            try: os.remove(os.path.join(BACKUP_DIR, f))
+            except Exception: pass
+    except Exception as e:
+        log.warning(f"auto-backup skipped: {e}")
+
+
+def init_db():
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS players (
+        user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+        coins INTEGER DEFAULT 0, points INTEGER DEFAULT 0,
+        last_daily TEXT, last_weekly TEXT, last_claim TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS actors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL, role TEXT DEFAULT 'actor',
+        rarity TEXT DEFAULT 'Supporting', known_for TEXT DEFAULT '',
+        file_id TEXT, image_url TEXT, image_source TEXT,
+        description TEXT, active INTEGER DEFAULT 1,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS pics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor_id INTEGER NOT NULL,
+        file_id TEXT, public_url TEXT,
+        added_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS user_actors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL, actor_id INTEGER NOT NULL,
+        grabbed_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS spawns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL, message_id INTEGER,
+        actor_id INTEGER NOT NULL,
+        spawned_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        expires_at TEXT, status TEXT DEFAULT 'active', grabbed_by INTEGER)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS group_counters (
+        chat_id INTEGER PRIMARY KEY, msg_count INTEGER DEFAULT 0,
+        total_spawns INTEGER DEFAULT 0, last_spawn TEXT,
+        title TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS group_members (
+        chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+        first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (chat_id, user_id))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS admins (
+        user_id INTEGER PRIMARY KEY, added_by INTEGER,
+        added_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_ua_user ON user_actors(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ua_actor ON user_actors(actor_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pics_actor ON pics(actor_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pics_null ON pics(public_url)",
+        "CREATE INDEX IF NOT EXISTS idx_spawn_chat ON spawns(chat_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_actor_active ON actors(active)",
+        "CREATE INDEX IF NOT EXISTS idx_gm_chat ON group_members(chat_id)",
+    ]:
+        c.execute(idx)
+    try: c.execute("ALTER TABLE players ADD COLUMN last_claim TEXT")
+    except sqlite3.OperationalError: pass
+    conn.commit()
+    log.info("DB initialized (pooled)")
+
+
+def _now(): return datetime.now(timezone.utc)
+def _parse_dt(s):
+    if not s: return None
+    try:
+        d = datetime.fromisoformat(s)
+        if d.tzinfo is None: d = d.replace(tzinfo=timezone.utc)
+        return d
+    except Exception: return None
+
+
+def get_or_create_player(uid, username=None, first_name=None):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM players WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        if row:
+            c.execute("""UPDATE players SET username=COALESCE(?,username),
+                first_name=COALESCE(?,first_name) WHERE user_id=?""",
+                (username, first_name, uid))
+            c.execute("SELECT * FROM players WHERE user_id=?", (uid,))
+            return dict(c.fetchone())
+        c.execute("""INSERT INTO players (user_id, username, first_name, coins, points)
+                     VALUES (?,?,?,0,0)""", (uid, username, first_name))
+        c.execute("SELECT * FROM players WHERE user_id=?", (uid,))
+        return dict(c.fetchone())
+
+
+def add_coins_and_points(user_id, coins=0, points=0):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""UPDATE players SET coins = COALESCE(coins,0) + ?,
+                     points = COALESCE(points,0) + ? WHERE user_id=?""",
+                  (coins, points, user_id))
+        if c.rowcount == 0:
+            c.execute("INSERT INTO players (user_id, coins, points) VALUES (?,?,?)",
+                      (user_id, coins, points))
+
+
+def add_coins(user_id, amount):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE players SET coins = COALESCE(coins,0) + ? WHERE user_id=?", (amount, user_id))
+        if c.rowcount == 0:
+            c.execute("INSERT INTO players (user_id, coins) VALUES (?,?)", (user_id, amount))
+
+
+def get_coins(user_id):
+    c = _conn().cursor()
+    c.execute("SELECT COALESCE(coins,0) AS c FROM players WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row["c"] if row else 0
+
+
+def get_points(user_id):
+    c = _conn().cursor()
+    c.execute("SELECT COALESCE(points,0) AS p FROM players WHERE user_id=?", (user_id,))
+    row = c.fetchone()
+    return row["p"] if row else 0
+
+
+def set_player_field(uid, field, value):
+    with get_conn() as conn:
+        conn.execute(f"UPDATE players SET {field}=? WHERE user_id=?", (value, uid))
+
+
+def is_admin(uid):
+    if uid == OWNER_ID: return True
+    c = _conn().cursor()
+    c.execute("SELECT user_id FROM admins WHERE user_id=?", (uid,))
+    return c.fetchone() is not None
+
+
+def add_admin(uid, added_by):
+    with get_conn() as conn:
+        try:
+            conn.execute("INSERT INTO admins (user_id, added_by) VALUES (?,?)", (uid, added_by))
+            return True
+        except sqlite3.IntegrityError: return False
+
+
+def remove_admin(uid):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        return c.rowcount > 0
+
+
+def get_all_admins():
+    c = _conn().cursor()
+    c.execute("SELECT user_id FROM admins ORDER BY added_at DESC")
+    return [dict(r) for r in c.fetchall()]
+
+
+def add_actor(name, role, rarity, known_for="", file_id=None, image_url=None, description=""):
+    src = "file_id" if file_id else "url"
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""INSERT INTO actors (name, role, rarity, known_for,
+            file_id, image_url, image_source, description) VALUES (?,?,?,?,?,?,?,?)""",
+            (name, role, rarity, known_for, file_id, image_url, src, description))
+        aid = c.lastrowid
+    _invalidate_actor_cache()
+    return aid
+
+
+def add_pic(actor_id, file_id=None, public_url=None):
+    with get_conn() as conn:
+        conn.execute("INSERT INTO pics (actor_id, file_id, public_url) VALUES (?,?,?)",
+                     (actor_id, file_id, public_url))
+
+
+def get_pics(actor_id):
+    c = _conn().cursor()
+    c.execute("SELECT file_id, public_url FROM pics WHERE actor_id=?", (actor_id,))
+    return [dict(r) for r in c.fetchall()]
+
+
+def get_cover_url(actor_id):
+    c = _conn().cursor()
+    c.execute("""SELECT public_url FROM pics
+                 WHERE actor_id=? AND public_url IS NOT NULL LIMIT 1""", (actor_id,))
+    row = c.fetchone()
+    return row["public_url"] if row else None
+
+
+def get_cover_file_id(actor_id):
+    c = _conn().cursor()
+    c.execute("""SELECT file_id FROM pics
+                 WHERE actor_id=? AND file_id IS NOT NULL LIMIT 1""", (actor_id,))
+    row = c.fetchone()
+    if row and row["file_id"]:
+        return row["file_id"]
+    c.execute("""SELECT file_id FROM actors
+                 WHERE id=? AND file_id IS NOT NULL LIMIT 1""", (actor_id,))
+    row = c.fetchone()
+    return row["file_id"] if row and row["file_id"] else None
+
+
+def count_pics(actor_id):
+    c = _conn().cursor()
+    c.execute("SELECT COUNT(*) FROM pics WHERE actor_id=?", (actor_id,))
+    return c.fetchone()[0]
+
+
+def get_null_url_pics():
+    c = _conn().cursor()
+    c.execute("""SELECT id, file_id FROM pics
+                 WHERE public_url IS NULL AND file_id IS NOT NULL""")
+    return [dict(r) for r in c.fetchall()]
+
+
+def set_pic_url(pic_id, url):
+    with get_conn() as conn:
+        conn.execute("UPDATE pics SET public_url=? WHERE id=?", (url, pic_id))
+
+
+def migrate_actors_to_pics():
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""SELECT a.id, a.file_id, a.image_url, a.image_source
+                     FROM actors a
+                     WHERE a.active=1
+                     AND NOT EXISTS (SELECT 1 FROM pics p WHERE p.actor_id = a.id)""")
+        rows = [dict(r) for r in c.fetchall()]
+        added = 0
+        for r in rows:
+            fid = r.get("file_id")
+            url = r.get("image_url") if r.get("image_source") == "url" else None
+            if fid or url:
+                c.execute("INSERT INTO pics (actor_id, file_id, public_url) VALUES (?,?,?)",
+                          (r["id"], fid, url))
+                added += 1
+    if added: _invalidate_actor_cache()
+    return added
+
+
+def get_actor(aid):
+    c = _conn().cursor()
+    c.execute("SELECT * FROM actors WHERE id=?", (aid,))
+    row = c.fetchone()
+    return dict(row) if row else None
+
+
+def _invalidate_actor_cache():
+    with _CACHE_LOCK:
+        _ACTOR_CACHE["ts"] = 0
+
+
+def _refresh_actor_cache():
+    with _CACHE_LOCK:
+        now = time.time()
+        if now - _ACTOR_CACHE["ts"] < ACTOR_CACHE_TTL and _ACTOR_CACHE["ids"]:
+            return
+        c = _conn().cursor()
+        c.execute("SELECT id, rarity FROM actors WHERE active=1")
+        ids = []; rarities = {}
+        for r in c.fetchall():
+            ids.append(r["id"])
+            rarities.setdefault(r["rarity"], []).append(r["id"])
+        _ACTOR_CACHE["ids"] = ids
+        _ACTOR_CACHE["rarities"] = rarities
+        _ACTOR_CACHE["ts"] = now
+
+
+def get_random_actor():
+    _refresh_actor_cache()
+    ids = _ACTOR_CACHE["ids"]
+    if not ids: return None
+    return get_actor(random.choice(ids))
+
+
+def get_random_actor_weighted():
+    _refresh_actor_cache()
+    rarities = _ACTOR_CACHE["rarities"]
+    if not rarities: return None
+    all_ids = []; weights = []
+    for rar, id_list in rarities.items():
+        w = CLAIM_WEIGHTS.get(rar, 5)
+        for aid in id_list:
+            all_ids.append(aid); weights.append(w)
+    if not all_ids: return None
+    aid = random.choices(all_ids, weights=weights, k=1)[0]
+    return get_actor(aid)
+
+
+def get_all_actors():
+    c = _conn().cursor()
+    c.execute("SELECT * FROM actors WHERE active=1 ORDER BY id DESC")
+    return [dict(r) for r in c.fetchall()]
+
+
+def search_actors(q, limit=50):
+    c = _conn().cursor()
+    if q:
+        like = f"%{q}%"
+        c.execute("""SELECT * FROM actors WHERE active=1
+                     AND (name LIKE ? OR known_for LIKE ?)
+                     ORDER BY id DESC LIMIT ?""", (like, like, limit))
+    else:
+        c.execute("SELECT * FROM actors WHERE active=1 ORDER BY id DESC LIMIT ?", (limit,))
+    return [dict(r) for r in c.fetchall()]
+
+
+def delete_actor(aid):
+    with get_conn() as conn:
+        conn.execute("UPDATE actors SET active=0 WHERE id=?", (aid,))
+    _invalidate_actor_cache()
+
+
+def count_user_actors(uid):
+    c = _conn().cursor()
+    c.execute("SELECT COUNT(*) FROM user_actors WHERE user_id=?", (uid,))
+    return c.fetchone()[0]
+
+
+def count_user_dups(uid, actor_id):
+    c = _conn().cursor()
+    c.execute("SELECT COUNT(*) FROM user_actors WHERE user_id=? AND actor_id=?", (uid, actor_id))
+    return c.fetchone()[0]
+
+
+def get_user_actors_grouped(uid):
+    c = _conn().cursor()
+    c.execute("""SELECT a.id AS actor_id, a.name, a.role, a.rarity, a.known_for,
+        a.file_id, a.image_url, a.image_source, a.description,
+        COUNT(ua.id) AS user_dup_count
+        FROM user_actors ua JOIN actors a ON ua.actor_id = a.id
+        WHERE ua.user_id=?
+        GROUP BY a.id
+        ORDER BY a.rarity, a.name""", (uid,))
+    rows = [dict(r) for r in c.fetchall()]
+    grouped = {}
+    for r in rows:
+        key = r.get("rarity") or "Supporting"
+        grouped.setdefault(key, []).append(r)
+    return grouped
+
+
+def get_user_rarity_counts(uid):
+    c = _conn().cursor()
+    c.execute("""SELECT a.rarity, COUNT(*) AS cnt FROM user_actors ua
+        JOIN actors a ON ua.actor_id = a.id WHERE ua.user_id=? GROUP BY a.rarity""", (uid,))
+    return {r["rarity"]: r["cnt"] for r in c.fetchall()}
+
+
+def create_spawn(chat_id, actor_id, expires_at):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO spawns (chat_id, actor_id, expires_at) VALUES (?,?,?)",
+                  (chat_id, actor_id, expires_at))
+        return c.lastrowid
+
+
+def set_spawn_message(sid, mid):
+    with get_conn() as conn:
+        conn.execute("UPDATE spawns SET message_id=? WHERE id=?", (mid, sid))
+
+
+def get_active_spawn(chat_id):
+    c = _conn().cursor()
+    c.execute("""SELECT * FROM spawns WHERE chat_id=? AND status='active'
+                 ORDER BY id DESC LIMIT 1""", (chat_id,))
+    row = c.fetchone()
+    return dict(row) if row else None
+
+
+def try_grab_spawn(spawn_id, user_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE spawns SET status='grabbed', grabbed_by=? WHERE id=? AND status='active'",
+                  (user_id, spawn_id))
+        if c.rowcount != 1: return False
+        c.execute("""INSERT INTO user_actors (user_id, actor_id)
+                     SELECT ?, actor_id FROM spawns WHERE id=?""", (user_id, spawn_id))
+        return True
+
+
+def expire_spawns():
+    now = _now().isoformat()
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("UPDATE spawns SET status='expired' WHERE status='active' AND expires_at<?", (now,))
+        return c.rowcount
+
+
+def get_expired_spawns_with_msg():
+    c = _conn().cursor()
+    c.execute("SELECT id, chat_id, message_id FROM spawns WHERE status='expired' AND message_id IS NOT NULL")
+    return [dict(r) for r in c.fetchall()]
+
+
+def clear_spawn_message(sid):
+    with get_conn() as conn:
+        conn.execute("UPDATE spawns SET message_id=NULL WHERE id=?", (sid,))
+
+
+def incr_msg(chat_id):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT msg_count FROM group_counters WHERE chat_id=?", (chat_id,))
+        row = c.fetchone()
+        if not row:
+            c.execute("INSERT INTO group_counters (chat_id, msg_count) VALUES (?,1)", (chat_id,))
+            return 1
+        nc = row["msg_count"] + 1
+        c.execute("UPDATE group_counters SET msg_count=? WHERE chat_id=?", (nc, chat_id))
+        return nc
+
+
+def reset_msg(chat_id):
+    with get_conn() as conn:
+        conn.execute("""UPDATE group_counters SET msg_count=0,
+                        total_spawns=total_spawns+1, last_spawn=CURRENT_TIMESTAMP
+                        WHERE chat_id=?""", (chat_id,))
+
+
+def set_group_title(chat_id, title):
+    with get_conn() as conn:
+        conn.execute("""INSERT INTO group_counters (chat_id, title) VALUES (?,?)
+                        ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title""",
+                     (chat_id, title))
+
+
+def track_group_member(chat_id, user_id):
+    with get_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO group_members (chat_id, user_id) VALUES (?,?)",
+                     (chat_id, user_id))
+
+
+def db_stats():
+    try:
+        c = _conn().cursor()
+        out = {}
+        for key, sql in [
+            ("players", "SELECT COUNT(*) FROM players"),
+            ("actors",  "SELECT COUNT(*) FROM actors WHERE active=1"),
+            ("grabs",   "SELECT COUNT(*) FROM user_actors"),
+            ("pics",    "SELECT COUNT(*) FROM pics"),
+            ("pics_null","SELECT COUNT(*) FROM pics WHERE public_url IS NULL"),
+            ("spawns",  "SELECT COUNT(*) FROM spawns"),
+            ("groups",  "SELECT COUNT(*) FROM group_counters"),
+        ]:
+            c.execute(sql)
+            out[key] = c.fetchone()[0]
+        return out
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def top_collectors(limit=10):
+    c = _conn().cursor()
+    c.execute("""SELECT p.user_id, p.first_name, p.username, p.points,
+                 COALESCE(COUNT(ua.id), 0) AS grabs
+                 FROM players p LEFT JOIN user_actors ua ON ua.user_id = p.user_id
+                 GROUP BY p.user_id
+                 ORDER BY grabs DESC, p.points DESC LIMIT ?""", (limit,))
+    return [dict(r) for r in c.fetchall()]
+
+
+def top_owners(limit=10):
+    c = _conn().cursor()
+    c.execute("""SELECT p.user_id, p.first_name, p.username, p.points,
+                 COALESCE(COUNT(ua.id), 0) AS grabs
+                 FROM players p LEFT JOIN user_actors ua ON ua.user_id = p.user_id
+                 GROUP BY p.user_id
+                 ORDER BY p.points DESC, grabs DESC LIMIT ?""", (limit,))
+    return [dict(r) for r in c.fetchall()]
+
+
+def top_groups(limit=10):
+    c = _conn().cursor()
+    c.execute("""SELECT gm.chat_id,
+                 COALESCE(gc.title, 'Unknown Group') AS title,
+                 COUNT(DISTINCT gm.user_id) AS members,
+                 COALESCE(SUM(cnt.c), 0) AS total_chars
+                 FROM group_members gm
+                 LEFT JOIN group_counters gc ON gc.chat_id = gm.chat_id
+                 LEFT JOIN (
+                     SELECT user_id, COUNT(*) AS c FROM user_actors GROUP BY user_id
+                 ) cnt ON cnt.user_id = gm.user_id
+                 GROUP BY gm.chat_id
+                 ORDER BY total_chars DESC, members DESC
+                 LIMIT ?""", (limit,))
+    return [dict(r) for r in c.fetchall()]
+
+
+# ═══════════════ RARITIES ═══════════════
+RARITY_EMOJI = {
+    "Extra":"⚪","Side":"🟢","Supporting":"🔵","Main Cast":"🟣",
+    "Second Lead":"🟠","Male Lead":"🔴","Female Lead":"💖",
+    "Iconic":"🌟","Legendary":"👑","Award Winner":"🏆",
+    "Hallyu King":"💎","Hallyu Queen":"💍",
+}
+RARITY_ORDER = list(RARITY_EMOJI.keys())
+def role_emoji(r): return "👨" if r == "actor" else "👩"
+def role_label(r): return "Actor" if r == "actor" else "Actress"
+
+
+# ═══════════════ TELEGRAPH ═══════════════
+async def fileid_to_public_url(bot, file_id):
+    if not file_id: return None
+    try:
+        f = await bot.get_file(file_id)
+        data = await f.download_as_bytearray()
+        loop = asyncio.get_event_loop()
+        def _post():
+            return requests.post("https://telegra.ph/upload",
+                files={"file": ("img.jpg", bytes(data), "image/jpeg")}, timeout=30)
+        r = await loop.run_in_executor(None, _post)
+        j = r.json()
+        if isinstance(j, list) and j and "src" in j[0]:
+            return "https://telegra.ph" + j[0]["src"]
+    except Exception as e:
+        log.warning(f"[telegraph] {e}")
+    return None
+
+
+async def background_fix_null_urls(bot):
+    try:
+        rows = get_null_url_pics()
+        if not rows: return
+        log.info(f"[bg-fix] {len(rows)} pics need CDN")
+        fixed = 0
+        for r in rows:
+            url = await fileid_to_public_url(bot, r["file_id"])
+            if url:
+                set_pic_url(r["id"], url)
+                fixed += 1
+            await asyncio.sleep(TELEGRAPH_DELAY)
+        log.info(f"[bg-fix] done — {fixed}/{len(rows)} fixed")
+    except Exception as e:
+        log.warning(f"[bg-fix] {e}")
+
+
+# ═══════════════ HEALTH ═══════════════
+class _HealthHandler(BaseHTTPRequestHandler):
+    def _send(self, code, payload):
+        body = json.dumps(payload, default=str).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", "/health", "/healthz"):
+            up = int(time.time() - BOT_START_TIME)
+            ok, integrity = db_integrity_check()
+            payload = {
+                "status": "ok" if ok and STATUS["bot_ready"] else "degraded",
+                "service": "korean-guess-bot", "version": "v3",
+                "uptime_seconds": up, "uptime_human": str(timedelta(seconds=up)),
+                "bot_ready": STATUS["bot_ready"], "bot_username": BOT_USERNAME,
+                "db": {
+                    "path": os.path.abspath(DB_PATH),
+                    "size_kb": os.path.getsize(DB_PATH)//1024 if os.path.exists(DB_PATH) else 0,
+                    "integrity": integrity, "counts": db_stats(),
+                },
+                "actor_cache": {"ids": len(_ACTOR_CACHE["ids"]),
+                                "age_s": int(time.time() - _ACTOR_CACHE["ts"]) if _ACTOR_CACHE["ts"] else 0},
+                "last_spawn_ts": STATUS["last_spawn_ts"],
+                "ts": datetime.utcnow().isoformat() + "Z",
+            }
+            self._send(200 if payload["status"] == "ok" else 503, payload)
+        elif self.path == "/ping":
+            self.send_response(200); self.end_headers(); self.wfile.write(b"pong")
+        else:
+            self._send(404, {"error": "not found"})
+
+    def log_message(self, *a, **k): pass
+
+
+def start_health_server():
+    try:
+        srv = HTTPServer((HEALTH_HOST, PORT), _HealthHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log.info(f"Health: http://{HEALTH_HOST}:{PORT}/health")
+    except Exception as e:
+        log.warning(f"health skipped: {e}")
+
+
+# ═══════════════ SPAM FILTER ═══════════════
+def is_spamming(chat_id, user_id):
+    now = time.time()
+    with _SPAM_LOCK:
+        key = (chat_id, user_id)
+        times = _SPAM_TRACK.get(key, [])
+        # prune old
+        times = [t for t in times if now - t < SPAM_WINDOW]
+        times.append(now)
+        _SPAM_TRACK[key] = times
+        # garbage collect: remove empty entries (safety)
+        if len(_SPAM_TRACK) > 5000:
+            _SPAM_TRACK.clear()
+        return len(times) > SPAM_LIMIT
+
+
+# ═══════════════ HELPERS ═══════════════
+async def is_joined(bot, uid):
+    for ch, _ in REQUIRED_CHANNELS:
+        try:
+            m = await bot.get_chat_member(ch, uid)
+            if m.status not in ("creator", "administrator", "member", "restricted"):
+                return False, f"You have not joined {ch}"
+        except Exception as e:
+            log.error(f"force-join {ch}: {e}")
+            return False, f"Bot is not admin in {ch}"
+    return True, "OK"
+
+
+def kb_join():
+    rows = [[InlineKeyboardButton(f"📢 {ch}", url=url)] for ch, url in REQUIRED_CHANNELS]
+    rows.append([InlineKeyboardButton(f"✅ {bi('I have Joined')}", callback_data="check_join")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_start_main():
+    """3 layers · 4 buttons: Add Me / Support + Help / Owner."""
+    add_link = f"https://t.me/{BOT_USERNAME}?startgroup=true"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"➕ {sc('Add Me To Your GC')} ➕", url=add_link)],
+        [
+            InlineKeyboardButton(f"💬 {sc('Support')}", url=SUPPORT_LINK),
+            InlineKeyboardButton(f"❓ {sc('Help')}", callback_data="ui:help"),
+        ],
+        [InlineKeyboardButton(f"👑 {sc('Owner')}", url=f"https://t.me/{OWNER_USERNAME}")],
+    ])
+
+
+def kb_help_back():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"🔙 {sc('Back')}", callback_data="ui:back")
+    ]])
+
+
+def _kb_rankings():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🏆 {sc('Top Collectors')}", callback_data="rk:top")],
+        [InlineKeyboardButton(f"👑 {sc('Top Owners')}", callback_data="rk:owners")],
+        [InlineKeyboardButton(f"🌍 {sc('Top Groups')}", callback_data="rk:groups")],
+        [InlineKeyboardButton(f"🔙 {sc('Back')}", callback_data="ui:back")],
+    ])
+
+
+def kb_collection_buttons(uid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🎴 {sc('Open My Gallery')}",
+            switch_inline_query_current_chat="collection.")],
+        [InlineKeyboardButton(f"🔍 {sc('Search All Characters')}",
+            switch_inline_query_current_chat="")],
+    ])
+
+
+# ═══════════════ TEXTS ═══════════════
+START_TEXT = (
+    "🇰🇷🎬 <b>KOREAN GUESS BOT</b> 🎬🇰🇷\n\n"
+    "👋 <b>Welcome, K-Drama Fans!</b>\n\n"
+    "🖼️ Look at the image\n"
+    "🤔 Guess the <b>actor / actress</b>\n"
+    "🎯 Give the correct answer &amp; earn points!\n\n"
+    "🏆 Climb the leaderboard!\n"
+    "🔥 Let's see who knows K-Dramas best!\n\n"
+    "👇 <b>Ready? Let's Guess!</b> 🎮\n\n"
+    "💙 <i>Powered by Abyss Dimension</i>"
+)
+
+HELP_TEXT = (
+    f"🇰🇷🎬 {sc('Korean Guess Bot')} 🎬🇰🇷\n\n"
+    f"{bi('Commands')}\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "🇰🇷 <code>/start</code> — Main menu\n"
+    "❓ <code>/help</code> — This help\n"
+    "🏠 <code>/menu</code> — Home\n"
+    "🔍 <code>/search</code> — Global search\n"
+    "📦 <code>/collection</code> — Your collection\n"
+    "💰 <code>/balance</code> — Coins and points\n"
+    "🎯 <code>/guess &lt;name&gt;</code> — Catch a spawn\n"
+    "🎁 <code>/gift</code> — Gift a character\n"
+    "🎰 <code>/claim</code> — Free random character (24h)\n"
+    "🔎 <code>/check &lt;id&gt;</code> — Actor info by ID\n"
+    "⏰ <code>/viewtime</code> — Gate progress\n"
+    "🏆 <code>/rankings</code> — Leaderboards\n"
+    "💰 <code>/daily</code> — 100 coins (24h)\n"
+    "💰 <code>/weekly</code> — 2000 coins (7d)\n\n"
+    "💙 <i>Powered by Abyss Dimension</i>"
+)
+
+OHELP_TEXT = (
+    f"🛠 {sc('Admin Panel')}\n\n"
+    f"{bi('Add / Manage Actors')}\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "▫️ <code>/addactor</code> — New entry\n"
+    "▫️ <code>/addpics &lt;id&gt;</code> — Extra pics\n"
+    "▫️ <code>/actorlist</code> — All actors\n"
+    "▫️ <code>/delactor &lt;id&gt;</code> — Delete\n\n"
+    f"{bi('Tools')}\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "▫️ <code>/fixurls</code> — Fix old CDN urls\n"
+    "▫️ <code>/status</code> · <code>/dbcheck</code> · <code>/backup</code>\n\n"
+    f"{bi('Admins')}\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "▫️ <code>/addadmin</code> · <code>/removeadmin</code> · <code>/admins</code>"
+)
+
+
+# ═══════════════ START / HELP ═══════════════
+async def cmd_start(update, context):
+    u = update.effective_user
+    try: get_or_create_player(u.id, u.username, u.first_name)
+    except Exception: pass
+    if u.id != OWNER_ID:
+        ok, _ = await is_joined(context.bot, u.id)
+        if not ok:
+            await update.message.reply_text(
+                "🔒 <b>Please join both channels first!</b>\n\n"
+                "<i>Join both, then tap 'I have Joined'.</i>",
+                parse_mode="HTML", reply_markup=kb_join())
+            return
+    try:
+        await update.message.reply_photo(photo=START_PHOTO, caption=START_TEXT,
+            parse_mode="HTML", reply_markup=kb_start_main())
+    except Exception:
+        try:
+            await update.message.reply_text(START_TEXT, parse_mode="HTML",
+                reply_markup=kb_start_main())
+        except Exception: pass
+
+
+async def cmd_help(update, context):
+    await update.message.reply_text(HELP_TEXT, parse_mode="HTML",
+        reply_markup=kb_help_back())
+
+
+async def cmd_ohelp(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 <b>Not Authorized.</b>", parse_mode="HTML"); return
+    await update.message.reply_text(OHELP_TEXT, parse_mode="HTML")
+
+
+# ═══════════════ SEARCH ═══════════════
+async def cmd_search(update, context):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"🎴 {sc('My Collection')}",
+            switch_inline_query_current_chat="collection.")],
+        [InlineKeyboardButton(f"🔍 {sc('Search All Characters')}",
+            switch_inline_query_current_chat="")],
+    ])
+    await update.message.reply_text(
+        "🔍 <b>Search Characters</b>\n\n"
+        "<i>Choose an option below.</i>",
+        parse_mode="HTML", reply_markup=kb)
+
+
+# ═══════════════ CHECK ═══════════════
+async def cmd_check(update, context):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "📌 <b>Usage:</b> <code>/check &lt;actor_id&gt;</code>",
+            parse_mode="HTML"); return
+    aid = int(context.args[0])
+    a = get_actor(aid)
+    if not a:
+        await update.message.reply_text(f"❌ Actor ID {aid} not found."); return
+    pc = count_pics(aid)
+    cover = get_cover_url(aid)
+    cover_fid = get_cover_file_id(aid)
+    rar = a.get("rarity", "Supporting"); re = RARITY_EMOJI.get(rar, "⚪")
+    ge = role_emoji(a.get("role", "actor"))
+    role_text = role_label(a.get("role", "actor"))
+    cap = (
+        f"{ge} <b>{a.get('name','?')}</b>\n\n"
+        f"🆔 <code>{aid}</code>\n"
+        f"⭐ {re} <b>{rar}</b>\n"
+        f"👤 {role_text}\n"
+        f"📺 {a.get('known_for','—') or '—'}\n"
+        f"🖼 <b>{pc}</b> pics\n"
+        f"🔒 Active: <b>{'Yes' if a.get('active') else 'No'}</b>"
+    )
+    if cover:
+        try:
+            await update.message.reply_photo(cover, caption=cap, parse_mode="HTML"); return
+        except Exception: pass
+    if cover_fid:
+        try:
+            await update.message.reply_photo(cover_fid, caption=cap, parse_mode="HTML"); return
+        except Exception: pass
+    await update.message.reply_text(cap, parse_mode="HTML")
+
+
+# ═══════════════ BALANCE ═══════════════
+async def cmd_balance(update, context):
+    u = update.effective_user
+    get_or_create_player(u.id, u.username, u.first_name)
+    coins = get_coins(u.id)
+    points = get_points(u.id)
+    total = count_user_actors(u.id)
+    await update.message.reply_text(
+        f"💰 {sc('Balance')}\n\n"
+        f"👤 <b>{u.first_name or 'Hunter'}</b>\n"
+        f"💵 Coins: <b>{coins}</b>\n"
+        f"🏆 Points: <b>{points}</b>\n"
+        f"🎴 Collection: <b>{total}</b>",
+        parse_mode="HTML")
+
+
+# ═══════════════ VIEWTIME ═══════════════
+async def cmd_viewtime(update, context):
+    chat = update.effective_chat
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("❌ This command works in groups only."); return
+    active = get_active_spawn(chat.id)
+    if active:
+        await update.message.reply_text(
+            "⚠️ <b>A spawn is already active.</b>\n\n"
+            "Use <code>/guess &lt;name&gt;</code> to grab it.",
+            parse_mode="HTML")
+        return
+    stats = get_group_stats(chat.id)
+    cur = stats.get("msg_count", 0)
+    total = stats.get("total_spawns", 0)
+    last = stats.get("last_spawn")
+    rem = max(0, SPAWN_MESSAGE_THRESHOLD - cur)
+    pct = min(100, int((cur / SPAWN_MESSAGE_THRESHOLD) * 100))
+    filled = int(pct / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    txt = (
+        "⏰ <b>GATE STATUS</b>\n\n"
+        f"📨 Messages: <b>{cur}/{SPAWN_MESSAGE_THRESHOLD}</b>\n"
+        f"📊 <code>{bar}</code> <b>{pct}%</b>\n\n"
+        f"⏳ <b>{rem}</b> messages until next spawn\n"
+        f"🎯 Total spawns: <b>{total}</b>"
+    )
+    if last:
+        txt += f"\n🕐 Last spawn: <code>{last}</code>"
+    await update.message.reply_text(txt, parse_mode="HTML")
+
+
+def get_group_stats(chat_id):
+    c = _conn().cursor()
+    c.execute("SELECT msg_count, total_spawns, last_spawn FROM group_counters WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    return dict(row) if row else {"msg_count": 0, "total_spawns": 0, "last_spawn": None}
+
+
+# ═══════════════ RANKINGS ═══════════════
+async def cmd_rankings(update, context):
+    await update.message.reply_text(f"🏆 {sc('Rankings')}\n\n<i>Choose:</i>",
+        parse_mode="HTML", reply_markup=_kb_rankings())
+
+
+# ═══════════════ INLINE QUERY (collection) ═══════════════
+async def inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    raw = (update.inline_query.query or "").strip()
+    uid = update.inline_query.from_user.id
+    log.info(f"[inline] raw='{raw}' uid={uid}")
+
+    low = raw.lower()
+
+    target = uid
+    mode = "search"
+    search_q = raw
+
+    # Detect collection mode
+    if low.startswith("collection") or low == "my":
+        mode = "collection"
+        # collection.<uid> or collection <uid> or collection.uid
+        suffix = ""
+        if "." in raw:
+            suffix = raw.split(".", 1)[1].strip()
+        elif " " in raw:
+            suffix = raw.split(" ", 1)[1].strip()
+        if suffix.isdigit():
+            target = int(suffix)
+        search_q = None
+    elif low.startswith("all"):
+        mode = "search"
+        search_q = raw[3:].strip(": ").strip()
+
+    if mode == "collection":
+        grouped = get_user_actors_grouped(target)
+        actors = []
+        for r in RARITY_ORDER:
+            if r in grouped:
+                actors.extend(grouped[r])
+        actors = actors[:50]
+        empty_msg = ("Your collection is empty. Wait for a spawn in the group "
+                     "and use /guess <name> to grab one."
+                     if target == uid else "This user's collection is empty.")
+    else:
+        actors = search_actors(search_q, 50)
+        empty_msg = (f"No results for '{search_q}'."
+                     if search_q else "No characters added yet.")
+
+    log.info(f"[inline] mode={mode} target={target} actors={len(actors)}")
+
+    results = []
+    for a in actors:
+        cover = get_cover_url(a["id"])
+        cover_fid = get_cover_file_id(a["id"])
+        pc = count_pics(a["id"]) or (1 if cover_fid or cover else 0)
+        caption = (f"🎴 <b>{a['name']}</b>\n"
+                   f"📺 {a.get('known_for') or '—'}\n"
+                   f"⭐ {a.get('rarity','')}\n"
+                   f"🖼 {pc} pics")
+        desc = f"{a.get('known_for') or '—'} · {a.get('rarity','')} · {pc} pics"
+        try:
+            if cover:
+                results.append(InlineQueryResultPhoto(
+                    id=f"a{a['id']}", photo_url=cover, thumbnail_url=cover,
+                    title=a["name"], description=desc,
+                    caption=caption, parse_mode="HTML"))
+            elif cover_fid:
+                results.append(InlineQueryResultCachedPhoto(
+                    id=f"a{a['id']}", photo_file_id=cover_fid,
+                    title=a["name"], description=desc,
+                    caption=caption, parse_mode="HTML"))
+        except Exception as e:
+            log.warning(f"inline build: {e}")
+
+    if not results:
+        results.append(InlineQueryResultArticle(
+            id="none", title="❌ Empty", description=empty_msg,
+            input_message_content=InputTextMessageContent(empty_msg)))
+
+    try:
+        await update.inline_query.answer(results, cache_time=0, is_personal=True)
+    except Exception as e:
+        log.warning(f"inline answer: {e}")
+
+
+async def chosen_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    r = update.chosen_inline_result
+    if not r or not r.result_id.startswith("a"): return
+    try: aid = int(r.result_id[1:])
+    except ValueError: return
+    pics = get_pics(aid)
+    fids = [p["file_id"] for p in pics if p.get("file_id")]
+    if not fids:
+        a = get_actor(aid)
+        if a and a.get("file_id"): fids = [a["file_id"]]
+    if not fids: return
+    for i in range(0, len(fids), 10):
+        chunk = fids[i:i+10]
+        media = [InputMediaPhoto(fid) for fid in chunk]
+        try:
+            await ctx.bot.send_media_group(chat_id=r.from_user.id, media=media)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            log.warning(f"[album] {e}")
+
+
+# ═══════════════ COLLECTION MESSAGE ═══════════════
+async def _show_collection(q_or_msg, context, user):
+    uid = user.id
+    total = count_user_actors(uid)
+    if total == 0:
+        txt = ("🌑 <b>Your collection is empty.</b>\n\n"
+               "Wait for a spawn in the group, then use /guess to catch one.")
+        try:
+            if hasattr(q_or_msg, "edit_message_text"):
+                if q_or_msg.message.caption is not None:
+                    await q_or_msg.edit_message_caption(caption=txt, parse_mode="HTML")
+                else:
+                    await q_or_msg.edit_message_text(txt, parse_mode="HTML")
+            else:
+                await q_or_msg.reply_text(txt, parse_mode="HTML")
+        except Exception:
+            try: await q_or_msg.message.reply_text(txt, parse_mode="HTML")
+            except Exception: pass
+        return
+
+    coins = get_coins(uid); points = get_points(uid)
+    rc = get_user_rarity_counts(uid)
+
+    lines = [
+        f"🎴 <b>{user.first_name or 'Hunter'}'s Collection</b>",
+        f"💰 Coins: <b>{coins}</b>  |  🏆 Points: <b>{points}</b>",
+        f"🌸 Total: <b>{total}</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for r in RARITY_ORDER:
+        if r in rc:
+            lines.append(f"{RARITY_EMOJI.get(r,'⚪')} <b>{r}</b>: {rc[r]}")
+    lines.append("")
+    lines.append("<i>Tap below to open your gallery.</i>")
+
+    kb = kb_collection_buttons(uid)
+    txt = "\n".join(lines)
+    try:
+        if hasattr(q_or_msg, "edit_message_text"):
+            if q_or_msg.message.caption is not None:
+                await q_or_msg.edit_message_caption(caption=txt, parse_mode="HTML", reply_markup=kb)
+            else:
+                await q_or_msg.edit_message_text(txt, parse_mode="HTML", reply_markup=kb,
+                    disable_web_page_preview=True)
+        else:
+            await q_or_msg.reply_text(txt, parse_mode="HTML", reply_markup=kb,
+                disable_web_page_preview=True)
+    except Exception:
+        try:
+            await q_or_msg.message.reply_text(txt, parse_mode="HTML", reply_markup=kb,
+                disable_web_page_preview=True)
+        except Exception: pass
+
+
+async def cmd_collection(update, context):
+    u = update.effective_user
+    ok, reason = await is_joined(context.bot, u.id)
+    if not ok:
+        await update.message.reply_text(f"🔒 <b>Join both channels first.</b>\n\n⚠️ {reason}",
+            parse_mode="HTML", reply_markup=kb_join()); return
+    await _show_collection(update.message, context, u)
+
+
+async def cmd_home(update, context):
+    await cmd_collection(update, context)
+
+
+# ═══════════════ UI CALLBACKS ═══════════════
+async def cb_ui(update, context):
+    q = update.callback_query
+    data = q.data or ""
+    await q.answer()
+
+    if data == "ui:help":
+        try:
+            if q.message.caption is not None:
+                await q.edit_message_caption(caption=HELP_TEXT, parse_mode="HTML",
+                    reply_markup=kb_help_back())
+            else:
+                await q.edit_message_text(HELP_TEXT, parse_mode="HTML",
+                    reply_markup=kb_help_back())
+        except Exception: pass
+        return
+
+    if data == "ui:back":
+        try:
+            if q.message.caption is not None:
+                await q.edit_message_caption(caption=START_TEXT, parse_mode="HTML",
+                    reply_markup=kb_start_main())
+            else:
+                await q.edit_message_text(START_TEXT, parse_mode="HTML",
+                    reply_markup=kb_start_main())
+        except Exception: pass
+        return
+
+    if data == "ui:coll":
+        await _show_collection(q, context, q.from_user); return
+
+    if data == "ui:rank":
+        try:
+            await q.edit_message_text(f"🏆 {sc('Rankings')}\n\n<i>Choose a category:</i>",
+                parse_mode="HTML", reply_markup=_kb_rankings())
+        except Exception:
+            try: await q.message.reply_text(f"🏆 {sc('Rankings')}\n\n<i>Choose:</i>",
+                parse_mode="HTML", reply_markup=_kb_rankings())
+            except Exception: pass
+        return
+
+    if data == "check_join":
+        ok, reason = await is_joined(context.bot, q.from_user.id)
+        if ok:
+            await q.answer("✅ Verified!", show_alert=True)
+            try: await q.edit_message_text("🟢 <b>Verified!</b> Use /start.", parse_mode="HTML")
+            except Exception: pass
+        else:
+            await q.answer(f"❌ {reason}", show_alert=True)
+        return
+
+    if data == "rk:top":
+        rows = top_collectors(10)
+        if not rows:
+            await q.answer("No data yet.", show_alert=True); return
+        medals = ["🥇","🥈","🥉"]
+        txt = f"🏆 {sc('Top 10 Collectors')}\n\n"
+        for i, r in enumerate(rows):
+            prefix = medals[i] if i < 3 else f"{i+1}."
+            name = r["first_name"] or r["username"] or f"User {r['user_id']}"
+            txt += f"{prefix} {name} — <b>{r['grabs']}</b> 🎴  ·  {r['points']} pts\n"
+        try:
+            await q.edit_message_text(txt, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ʙᴀᴄᴋ", callback_data="ui:rank")]]))
+        except Exception: pass
+        return
+
+    if data == "rk:owners":
+        rows = top_owners(10)
+        if not rows:
+            await q.answer("No data yet.", show_alert=True); return
+        medals = ["🥇","🥈","🥉"]
+        txt = f"👑 {sc('Top Owners')}\n\n"
+        for i, r in enumerate(rows):
+            prefix = medals[i] if i < 3 else f"{i+1}."
+            name = r["first_name"] or r["username"] or f"User {r['user_id']}"
+            txt += f"{prefix} {name} — <b>{r['points']}</b> pts · {r['grabs']} 🎴\n"
+        try:
+            await q.edit_message_text(txt, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ʙᴀᴄᴋ", callback_data="ui:rank")]]))
+        except Exception: pass
+        return
+
+    if data == "rk:groups":
+        rows = top_groups(10)
+        if not rows:
+            await q.answer("No groups tracked yet.", show_alert=True); return
+        medals = ["🥇","🥈","🥉"]
+        txt = f"🌍 {sc('Top Groups')}\n\n"
+        for i, r in enumerate(rows):
+            prefix = medals[i] if i < 3 else f"{i+1}."
+            title = (r["title"] or "Unknown")[:32]
+            txt += (f"{prefix} <b>{title}</b>\n"
+                    f"     🎴 {r['total_chars']}  ·  👥 {r['members']}\n")
+        try:
+            await q.edit_message_text(txt, parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ʙᴀᴄᴋ", callback_data="ui:rank")]]))
+        except Exception: pass
+        return
+
+
+# ═══════════════ /guess ═══════════════
+async def cmd_guess(update, context):
+    chat = update.effective_chat; u = update.effective_user
+    if chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("❌ This command works in groups only."); return
+    if not context.args:
+        await update.message.reply_text("❌ <code>/guess &lt;name&gt;</code>", parse_mode="HTML"); return
+
+    user_input = " ".join(context.args).strip().lower()
+    active = get_active_spawn(chat.id)
+    if not active:
+        await update.message.reply_text("🌑 No active spawn right now."); return
+    actor = get_actor(active["actor_id"])
+    if not actor:
+        await update.message.reply_text("❌ Character missing."); return
+
+    correct = (actor.get("name") or "").strip().lower()
+    matched = (user_input == correct)
+    if not matched and len(user_input) >= 3:
+        cw = correct.split(); uw = user_input.split()
+        if len(cw) >= 2:
+            for w in uw:
+                if len(w) >= 3 and w in cw:
+                    matched = True; break
+    if not matched:
+        await update.message.reply_text("❌ Wrong name. Try again."); return
+
+    if not try_grab_spawn(active["id"], u.id):
+        await update.message.reply_text("⚡ Someone else grabbed it first."); return
+
+    try: get_or_create_player(u.id, u.username, u.first_name)
+    except Exception: pass
+    add_coins_and_points(u.id, GUESS_REWARD_COINS, 1)
+
+    rarity = actor.get("rarity", "Supporting")
+    re = RARITY_EMOJI.get(rarity, "⚪")
+    ge = role_emoji(actor.get("role", "actor"))
+    name = actor.get("name") or "?"
+    total = count_user_actors(u.id); coins = get_coins(u.id); points = get_points(u.id)
+
+    mention = f"@{u.username}" if u.username else f'<a href="tg://user?id={u.id}">{u.first_name}</a>'
+    cap = (f"✨ {sc('Correct Guess')} ✨\n\n"
+           f"🎉 {mention} {bi('got it right!')}\n\n"
+           f"{ge} <b>{name}</b>\n⭐ {re} <b>{rarity}</b>\n\n"
+           f"💰 +{GUESS_REWARD_COINS} coins  (total <b>{coins}</b>)\n"
+           f"🏆 Points: <b>{points}</b>  |  📦 Collection: <b>{total}</b>")
+    photo = actor["image_url"] if actor["image_source"] == "url" else actor["file_id"]
+    try: await context.bot.send_photo(chat.id, photo, caption=cap, parse_mode="HTML")
+    except Exception: await update.message.reply_text(cap, parse_mode="HTML")
+
+
+# ═══════════════ /gift ═══════════════
+async def cmd_gift(update, context):
+    u = update.effective_user; msg = update.message; args = context.args or []
+    target_id = None; target_name = None; target_un = None; aid = None
+    replied_user = msg.reply_to_message.from_user if (msg.reply_to_message and msg.reply_to_message.from_user) else None
+
+    if replied_user and len(args) == 1:
+        if not args[0].lstrip("-").isdigit():
+            await msg.reply_text("❌ In reply mode, only the actor ID is needed."); return
+        target_id = replied_user.id
+        target_name = replied_user.first_name or f"User {replied_user.id}"
+        target_un = replied_user.username
+        aid = int(args[0])
+    elif len(args) == 2:
+        target_arg, aid_arg = args[0].strip(), args[1].strip()
+        if not aid_arg.isdigit():
+            await msg.reply_text("❌ Actor ID must be a number."); return
+        aid = int(aid_arg)
+        if target_arg.lstrip("-").isdigit():
+            target_id = int(target_arg)
+        elif target_arg.startswith("@"):
+            try:
+                chat = await context.bot.get_chat(target_arg)
+                target_id = chat.id; target_un = chat.username
+                target_name = chat.first_name or f"User {target_id}"
+            except Exception:
+                await msg.reply_text(f"❌ Could not resolve <code>{target_arg}</code>.", parse_mode="HTML"); return
+        else:
+            await msg.reply_text("❌ Format:\n<code>/gift &lt;user_id&gt; &lt;actor_id&gt;</code>\n"
+                                  "<code>/gift @username &lt;actor_id&gt;</code>\n"
+                                  "<i>or reply to a message with</i> <code>/gift &lt;actor_id&gt;</code>",
+                                  parse_mode="HTML"); return
+        if target_name is None:
+            try:
+                tchat = await context.bot.get_chat(target_id)
+                target_name = tchat.first_name or f"User {target_id}"
+                target_un = tchat.username
+            except Exception: target_name = f"User {target_id}"
+    else:
+        await msg.reply_text(
+            f"🎁 {sc('Gift a character')}\n\n<b>3 ways:</b>\n"
+            "1️⃣ <code>/gift &lt;user_id&gt; &lt;actor_id&gt;</code>\n"
+            "2️⃣ <code>/gift @username &lt;actor_id&gt;</code>\n"
+            "3️⃣ Reply to a message with <code>/gift &lt;actor_id&gt;</code>\n\n"
+            f"<i>Actor ID is shown in /collection.</i>", parse_mode="HTML")
+        return
+
+    if target_id == u.id:
+        await msg.reply_text("😐 You cannot gift yourself."); return
+    a = get_actor(aid)
+    if not a:
+        await msg.reply_text(f"❌ Actor ID {aid} not found."); return
+    if count_user_dups(u.id, aid) == 0:
+        await msg.reply_text(f"❌ <b>{a.get('name')}</b> is not in your collection."); return
+
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""DELETE FROM user_actors WHERE id = (
+            SELECT id FROM user_actors WHERE user_id=? AND actor_id=? LIMIT 1)""", (u.id, aid))
+        c.execute("INSERT INTO user_actors (user_id, actor_id) VALUES (?,?)", (target_id, aid))
+
+    rar = a.get("rarity", "Supporting"); re = RARITY_EMOJI.get(rar, "⚪")
+    ge = role_emoji(a.get("role", "actor"))
+    giver_mention = f"@{u.username}" if u.username else f'<a href="tg://user?id={u.id}">{u.first_name}</a>'
+    target_mention = f"@{target_un}" if target_un else f'<a href="tg://user?id={target_id}">{target_name}</a>'
+
+    cap = (f"🎁 {sc('Character Gifted')}\n\n"
+           f"👤 {bi('From')}: {giver_mention}\n🎯 {bi('To')}: {target_mention}\n\n"
+           f"{ge} <b>{a.get('name')}</b>\n⭐ {re} {rar}\n🆔 <code>{aid}</code>")
+    photo = a["image_url"] if a["image_source"] == "url" else a["file_id"]
+    try: await msg.reply_photo(photo, caption=cap, parse_mode="HTML")
+    except Exception: await msg.reply_text(cap, parse_mode="HTML")
+
+    try:
+        await context.bot.send_message(target_id,
+            f"🎁 {sc('You received a character!')}\n\n"
+            f"👤 {bi('From')}: {giver_mention}\n"
+            f"{ge} <b>{a.get('name')}</b>  ({re} {rar})\n🆔 <code>{aid}</code>",
+            parse_mode="HTML")
+    except Exception: pass
+
+
+# ═══════════════ /claim ═══════════════
+async def cmd_claim(update, context):
+    u = update.effective_user
+    p = get_or_create_player(u.id, u.username, u.first_name)
+    last = _parse_dt(p.get("last_claim")); now = _now()
+
+    if last and (now - last) < CLAIM_COOLDOWN:
+        left = CLAIM_COOLDOWN - (now - last)
+        h, rem = divmod(int(left.total_seconds()), 3600); m = rem // 60
+        await update.message.reply_text(
+            f"⏳ <b>Claim already used</b>\n\nCome back in <b>{h}h {m}m</b>",
+            parse_mode="HTML"); return
+
+    actor = get_random_actor_weighted()
+    if not actor:
+        await update.message.reply_text("🌑 No actors available right now."); return
+
+    with get_conn() as conn:
+        conn.execute("INSERT INTO user_actors (user_id, actor_id) VALUES (?,?)",
+                     (u.id, actor["id"]))
+        conn.execute("UPDATE players SET last_claim=? WHERE user_id=?",
+                     (now.isoformat(), u.id))
+
+    rar = actor.get("rarity", "Supporting"); re = RARITY_EMOJI.get(rar, "⚪")
+    ge = role_emoji(actor.get("role", "actor"))
+    total = count_user_actors(u.id)
+    dups = count_user_dups(u.id, actor["id"])
+
+    mention = f"@{u.username}" if u.username else f'<a href="tg://user?id={u.id}">{u.first_name}</a>'
+    cap = (f"🎰 {sc('Claim Success')} 🎰\n\n"
+           f"🎉 {mention} {bi('received a random character!')}\n\n"
+           f"{ge} <b>{actor.get('name','?')}</b>\n"
+           f"⭐ {re} <b>{rar}</b>\n"
+           f"📺 {actor.get('known_for','—') or '—'}\n\n"
+           f"📦 Collection: <b>{total}</b>  (x{dups} of this)\n"
+           f"⏰ Next claim in 24h")
+    photo = actor["image_url"] if actor["image_source"] == "url" else actor["file_id"]
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"🎴 {sc('My Collection')}", callback_data="ui:coll")
+    ]])
+    try:
+        await update.message.reply_photo(photo, caption=cap, parse_mode="HTML", reply_markup=kb)
+    except Exception:
+        await update.message.reply_text(cap, parse_mode="HTML", reply_markup=kb)
+
+
+# ═══════════════ Daily / Weekly ═══════════════
+async def cmd_daily(update, context):
+    u = update.effective_user
+    p = get_or_create_player(u.id, u.username, u.first_name)
+    last = _parse_dt(p.get("last_daily")); now = _now()
+    if last and (now - last) < DAILY_COOLDOWN:
+        left = DAILY_COOLDOWN - (now - last)
+        h, rem = divmod(int(left.total_seconds()), 3600); m = rem // 60
+        await update.message.reply_text(
+            f"⏳ <b>Daily already claimed</b>\nCome back in <b>{h}h {m}m</b>\n"
+            f"Balance: <code>{get_coins(u.id)}</code>", parse_mode="HTML"); return
+    add_coins(u.id, DAILY_COINS)
+    set_player_field(u.id, "last_daily", now.isoformat())
+    await update.message.reply_text(
+        f"✅ <b>Daily claimed</b>\n💰 +{DAILY_COINS} coins\n"
+        f"💼 Balance: <b>{get_coins(u.id)}</b>\n⏰ Next in 24h", parse_mode="HTML")
+
+
+async def cmd_weekly(update, context):
+    u = update.effective_user
+    p = get_or_create_player(u.id, u.username, u.first_name)
+    last = _parse_dt(p.get("last_weekly")); now = _now()
+    if last and (now - last) < WEEKLY_COOLDOWN:
+        left = WEEKLY_COOLDOWN - (now - last)
+        d = left.days; h = left.seconds // 3600
+        await update.message.reply_text(
+            f"⏳ <b>Weekly already claimed</b>\nCome back in <b>{d}d {h}h</b>\n"
+            f"Balance: <code>{get_coins(u.id)}</code>", parse_mode="HTML"); return
+    add_coins(u.id, WEEKLY_COINS)
+    set_player_field(u.id, "last_weekly", now.isoformat())
+    await update.message.reply_text(
+        f"✅ <b>Weekly claimed</b>\n💰 +{WEEKLY_COINS} coins\n"
+        f"💼 Balance: <b>{get_coins(u.id)}</b>\n⏰ Next in 7 days", parse_mode="HTML")
+
+
+# ═══════════════ SPAWN ═══════════════
+async def track_message(update, context):
+    """Message counter + spawn trigger + spam filter."""
+    try:
+        chat = update.effective_chat
+        if chat.type not in ("group", "supergroup"): return
+        u = update.effective_user
+        if not u or u.is_bot: return
+        chat_id = chat.id
+        user_id = u.id
+
+        # spam check — if user is spamming, ignore their messages entirely
+        if is_spamming(chat_id, user_id):
+            return
+
+        # track member + title
+        try:
+            track_group_member(chat_id, user_id)
+            if chat.title: set_group_title(chat_id, chat.title)
+        except Exception: pass
+
+        # spawn check
+        if get_active_spawn(chat_id): return
+        count = incr_msg(chat_id)
+        log.info(f"[track] chat={chat_id} count={count}/{SPAWN_MESSAGE_THRESHOLD}")
+        if count >= SPAWN_MESSAGE_THRESHOLD:
+            reset_msg(chat_id)
+            await spawn_actor(chat_id, context)
+    except Exception as e:
+        log.warning(f"[track] {e}")
+
+
+async def spawn_actor(chat_id, context):
+    a = get_random_actor()
+    if not a: return
+    exp = (_now() + timedelta(seconds=SPAWN_EXPIRY_SECONDS)).isoformat()
+    sid = create_spawn(chat_id, a["id"], exp)
+    cap = (f"🇰🇷 {sc('Actor / Actress Has Appeared')}\n"
+           f"Type <code>/guess &lt;name&gt;</code> {sc('to catch')}")
+    photo = a["image_url"] if a["image_source"] == "url" else a["file_id"]
+    try:
+        msg = await context.bot.send_photo(chat_id=chat_id, photo=photo,
+                                            caption=cap, parse_mode="HTML")
+        set_spawn_message(sid, msg.message_id)
+        STATUS["last_spawn_ts"] = int(time.time())
+    except Exception as e:
+        log.error(f"spawn fail: {e}")
+        STATUS["last_error"] = str(e)[:200]
+
+
+async def expire_job(context):
+    n = expire_spawns()
+    if n: log.info(f"expired {n} spawns")
+    rows = get_expired_spawns_with_msg()
+    for r in rows:
+        try: await context.bot.delete_message(chat_id=r["chat_id"], message_id=r["message_id"])
+        except Exception: pass
+        finally: clear_spawn_message(r["id"])
+
+
+# ═══════════════ ADDACTOR ═══════════════
+ASK_PHOTO, ASK_NAME, ASK_ROLE, ASK_RARITY, ASK_KNOWN_FOR = range(5)
+
+
+def _kb_role():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("👨 ᴀᴄᴛᴏʀ", callback_data="arole:actor"),
+        InlineKeyboardButton("👩 ᴀᴄᴛʀᴇꜱꜱ", callback_data="arole:actress"),
+    ]])
+
+
+def _kb_rarity():
+    buttons = []; row = []
+    for r, e in RARITY_EMOJI.items():
+        row.append(InlineKeyboardButton(f"{e} {r}", callback_data=f"arar:{r}"))
+        if len(row) == 2: buttons.append(row); row = []
+    if row: buttons.append(row)
+    return InlineKeyboardMarkup(buttons)
+
+
+async def addactor_start(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return ConversationHandler.END
+    context.user_data.clear()
+    await update.message.reply_text("📸 Send the actor/actress image.")
+    return ASK_PHOTO
+
+
+async def addactor_photo(update, context):
+    fid = url = None
+    if update.message.photo: fid = update.message.photo[-1].file_id
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        fid = update.message.document.file_id
+    elif update.message.text and update.message.text.startswith(("http://","https://")):
+        url = update.message.text.strip()
+    else:
+        await update.message.reply_text("❌ Send a photo, image file, or URL."); return ASK_PHOTO
+    context.user_data["file_id"] = fid; context.user_data["image_url"] = url
+    await update.message.reply_text("📝 Send the character name.")
+    return ASK_NAME
+
+
+async def addactor_name(update, context):
+    if not update.message.text:
+        await update.message.reply_text("❌ Send text."); return ASK_NAME
+    name = update.message.text.strip()
+    if not name or len(name) > 80:
+        await update.message.reply_text("❌ 1-80 characters."); return ASK_NAME
+    context.user_data["name"] = name
+    await update.message.reply_text(f"👤 <b>{name}</b>\n\nActor or Actress?",
+        parse_mode="HTML", reply_markup=_kb_role())
+    return ASK_ROLE
+
+
+async def addactor_role_cb(update, context):
+    q = update.callback_query; await q.answer()
+    r = q.data.split(":")[1]
+    context.user_data["role"] = r
+    await q.edit_message_text(f"Role: {role_label(r)}\n\n⭐ Choose rarity:", reply_markup=_kb_rarity())
+    return ASK_RARITY
+
+
+async def addactor_role_txt(update, context):
+    if not update.message.text: return ASK_ROLE
+    r = update.message.text.strip().lower()
+    if r not in ("actor","actress"):
+        await update.message.reply_text("❌ Use 'actor' or 'actress'."); return ASK_ROLE
+    context.user_data["role"] = r
+    await update.message.reply_text(f"Role: {role_label(r)}\n\n⭐ Choose rarity:", reply_markup=_kb_rarity())
+    return ASK_RARITY
+
+
+async def addactor_rarity_cb(update, context):
+    q = update.callback_query; await q.answer()
+    r = q.data.split(":",1)[1]
+    if r not in RARITY_EMOJI:
+        await q.answer("Invalid!", show_alert=True); return ASK_RARITY
+    context.user_data["rarity"] = r
+    await q.edit_message_text(f"Rarity: {RARITY_EMOJI.get(r,'⚪')} {r}\n\n📺 Known for?", parse_mode="HTML")
+    return ASK_KNOWN_FOR
+
+
+async def addactor_rarity_txt(update, context):
+    if not update.message.text: return ASK_RARITY
+    r = update.message.text.strip()
+    for k in RARITY_EMOJI:
+        if k.lower() == r.lower(): r = k; break
+    else:
+        await update.message.reply_text("❌ Use the buttons."); return ASK_RARITY
+    context.user_data["rarity"] = r
+    await update.message.reply_text(f"Rarity: {RARITY_EMOJI.get(r,'⚪')} {r}\n\n📺 Known for?", parse_mode="HTML")
+    return ASK_KNOWN_FOR
+
+
+async def addactor_known_for(update, context):
+    if not update.message.text:
+        await update.message.reply_text("❌ Send text (or 'skip')."); return ASK_KNOWN_FOR
+    kf = update.message.text.strip()
+    if kf.lower() == "skip": kf = ""
+    if len(kf) > 100:
+        await update.message.reply_text("❌ Up to 100 characters."); return ASK_KNOWN_FOR
+    d = context.user_data
+
+    status = await update.message.reply_text("⏳ Uploading...")
+    public_url = None
+    if d.get("file_id"):
+        public_url = await fileid_to_public_url(context.bot, d["file_id"])
+
+    aid = add_actor(name=d.get("name",""), role=d.get("role","actor"),
+                    rarity=d.get("rarity","Supporting"), known_for=kf,
+                    file_id=d.get("file_id"), image_url=d.get("image_url"))
+    if d.get("file_id") or d.get("image_url"):
+        add_pic(aid, d.get("file_id"), public_url or d.get("image_url"))
+
+    re = RARITY_EMOJI.get(d.get("rarity","Supporting"), "⚪")
+    ge = role_emoji(d.get("role","actor"))
+    tag = " ✅ CDN" if public_url else " 📁 file_id"
+    cap = (f"✅ {sc('Added')}\n\n🆔 <code>{aid}</code>\n"
+           f"{ge} <b>{d.get('name')}</b>\n⭐ {re} {d.get('rarity')}\n"
+           f"📺 {kf or '—'}{tag}\n\n"
+           f"<i>Extra pics:</i> <code>/addpics {aid}</code>")
+    try: await status.edit_text(cap, parse_mode="HTML")
+    except Exception: await update.message.reply_text(cap, parse_mode="HTML")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def addactor_cancel(update, context):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
+
+
+# ═══════════════ /addpics ═══════════════
+ADD_PICS_PHOTO = range(10, 11)
+
+
+async def addpics_start(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return ConversationHandler.END
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("📌 <code>/addpics &lt;actor_id&gt;</code>",
+            parse_mode="HTML"); return ConversationHandler.END
+    aid = int(context.args[0])
+    a = get_actor(aid)
+    if not a:
+        await update.message.reply_text(f"❌ ID {aid} not found."); return ConversationHandler.END
+    context.user_data["addpics_aid"] = aid
+    context.user_data["addpics_count"] = 0
+    await update.message.reply_text(
+        f"📸 Send pics for <b>{a['name']}</b> (id {aid}). <i>/done to finish.</i>",
+        parse_mode="HTML")
+    return ADD_PICS_PHOTO
+
+
+async def addpics_photo(update, context):
+    aid = context.user_data.get("addpics_aid")
+    if not aid: return ConversationHandler.END
+    fid = None
+    if update.message.photo: fid = update.message.photo[-1].file_id
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        fid = update.message.document.file_id
+    if not fid: return ADD_PICS_PHOTO
+    msg = await update.message.reply_text("⏳ Uploading...")
+    url = await fileid_to_public_url(context.bot, fid)
+    add_pic(aid, fid, url)
+    context.user_data["addpics_count"] = context.user_data.get("addpics_count", 0) + 1
+    tag = "✅ CDN" if url else "📁 file_id"
+    try: await msg.edit_text(f"📸 Pic {context.user_data['addpics_count']} — {tag}")
+    except Exception: pass
+    return ADD_PICS_PHOTO
+
+
+async def addpics_done(update, context):
+    n = context.user_data.get("addpics_count", 0)
+    await update.message.reply_text(f"🎉 {n} pics added.")
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def addpics_cancel(update, context):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
+
+
+# ═══════════════ /fixurls ═══════════════
+async def cmd_fixurls(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return
+    migrated = migrate_actors_to_pics()
+    rows = get_null_url_pics()
+    if not rows:
+        await update.message.reply_text(
+            f"✅ {sc('All Good')}\n\n🔄 Migrated: <b>{migrated}</b>\n📦 NULL urls: <b>0</b>",
+            parse_mode="HTML"); return
+
+    status = await update.message.reply_text(
+        f"⏳ {sc('Fixing URLs')}\n\n🔄 Migrated: <b>{migrated}</b>\n"
+        f"📦 Total: <b>{len(rows)}</b>", parse_mode="HTML")
+    ok = 0; fail = 0
+    for i, r in enumerate(rows, 1):
+        try:
+            url = await fileid_to_public_url(context.bot, r["file_id"])
+            if url: set_pic_url(r["id"], url); ok += 1
+            else: fail += 1
+        except Exception: fail += 1
+        if i % 10 == 0:
+            try:
+                await status.edit_text(
+                    f"⏳ {sc('Fixing URLs')} — {i}/{len(rows)}\n\n"
+                    f"✅ OK: <b>{ok}</b>  |  ❌ Failed: <b>{fail}</b>", parse_mode="HTML")
+            except Exception: pass
+        await asyncio.sleep(TELEGRAPH_DELAY)
+    try:
+        await status.edit_text(
+            f"✅ {sc('Fix Complete')}\n\n🔄 Migrated: <b>{migrated}</b>\n"
+            f"✅ Uploaded: <b>{ok}</b>\n❌ Failed: <b>{fail}</b>", parse_mode="HTML")
+    except Exception:
+        await update.message.reply_text(f"✅ Done — OK: {ok}, Failed: {fail}")
+
+
+# ═══════════════ ADMIN cmds ═══════════════
+async def cmd_actorlist(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return
+    ws = get_all_actors()
+    if not ws:
+        await update.message.reply_text("📭 None."); return
+    txt = f"👥 {sc('Actors')} ({len(ws)})\n\n"
+    for w in ws[:40]:
+        re = RARITY_EMOJI.get(w.get("rarity","Supporting"), "⚪")
+        ge = role_emoji(w.get("role","actor"))
+        pc = count_pics(w["id"])
+        txt += f"<code>{w['id']}</code> {ge}{re} {w.get('name','?')} — {w.get('known_for','')} ({pc} pics)\n"
+    if len(ws) > 40: txt += f"\n<i>...and {len(ws)-40} more</i>"
+    await update.message.reply_text(txt, parse_mode="HTML")
+
+
+async def cmd_delactor(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return
+    if not context.args:
+        await update.message.reply_text("📌 /delactor <id>"); return
+    try: aid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid."); return
+    if not get_actor(aid):
+        await update.message.reply_text(f"❌ ID {aid} not found."); return
+    delete_actor(aid)
+    await update.message.reply_text(f"✅ Deleted {aid}")
+
+
+async def cmd_status(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return
+    s = db_stats(); up = int(time.time() - BOT_START_TIME)
+    ok, integrity = db_integrity_check()
+    cache_age = int(time.time() - _ACTOR_CACHE["ts"]) if _ACTOR_CACHE["ts"] else "-"
+    await update.message.reply_text(
+        f"🗄️ {sc('Status')}\n\n⏱ <b>{timedelta(seconds=up)}</b>\n"
+        f"👥 Actors: <b>{s.get('actors',0)}</b>\n🎯 Grabs: <b>{s.get('grabs',0)}</b>\n"
+        f"🖼 Pics: <b>{s.get('pics',0)}</b> (null: <b>{s.get('pics_null',0)}</b>)\n"
+        f"👤 Players: <b>{s.get('players',0)}</b>\n💬 Groups: <b>{s.get('groups',0)}</b>\n"
+        f"⚡ Cache: <b>{len(_ACTOR_CACHE['ids'])}</b> ids ({cache_age}s)\n"
+        f"🔒 DB: <b>{'OK' if ok else integrity[:40]}</b>", parse_mode="HTML")
+
+
+async def cmd_dbcheck(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return
+    ok, msg = db_integrity_check()
+    size_kb = os.path.getsize(DB_PATH)//1024 if os.path.exists(DB_PATH) else 0
+    backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.startswith("kdrama_")]) \
+        if os.path.isdir(BACKUP_DIR) else []
+    nulls = len(get_null_url_pics())
+    await update.message.reply_text(
+        f"🔒 {sc('DB Health')}\n\n📁 <code>{os.path.abspath(DB_PATH)}</code>\n"
+        f"📦 <b>{size_kb} KB</b>\n✅ <b>{'OK' if ok else msg[:60]}</b>\n"
+        f"🖼 NULL urls: <b>{nulls}</b>\n💾 Backups: <b>{len(backups)}</b>", parse_mode="HTML")
+
+
+async def cmd_backup(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ Admin only."); return
+    if not os.path.exists(DB_PATH):
+        await update.message.reply_text("❌ DB not found."); return
+    try:
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dst = os.path.join(BACKUP_DIR, f"kdrama_{stamp}.db")
+        shutil.copy2(DB_PATH, dst)
+        kb = os.path.getsize(dst)//1024
+        await update.message.reply_document(open(dst, "rb"),
+            filename=f"kdrama_{stamp}.db", caption=f"💾 {kb} KB")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fail: {e}")
+
+
+async def cmd_addadmin(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Owner only."); return
+    tid = None
+    if update.message.reply_to_message: tid = update.message.reply_to_message.from_user.id
+    elif context.args:
+        try: tid = int(context.args[0])
+        except ValueError: pass
+    if not tid: await update.message.reply_text("📌 Reply or give ID."); return
+    if tid == OWNER_ID:
+        await update.message.reply_text("❌ Already owner."); return
+    if add_admin(tid, update.effective_user.id):
+        await update.message.reply_text(f"✅ Admin added: {tid}")
+    else:
+        await update.message.reply_text("⚠️ Already admin.")
+
+
+async def cmd_removeadmin(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Owner only."); return
+    tid = None
+    if update.message.reply_to_message: tid = update.message.reply_to_message.from_user.id
+    elif context.args:
+        try: tid = int(context.args[0])
+        except ValueError: pass
+    if tid and remove_admin(tid):
+        await update.message.reply_text(f"✅ Removed: {tid}")
+    else:
+        await update.message.reply_text("⚠️ Not an admin.")
+
+
+async def cmd_admins(update, context):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ Owner only."); return
+    admins = get_all_admins()
+    txt = f"👑 {sc('Admins')}\n\nOwner: <code>{OWNER_ID}</code>\n\n"
+    for a in admins: txt += f"▫️ <code>{a['user_id']}</code>\n"
+    if not admins: txt += "📭 None."
+    await update.message.reply_text(txt, parse_mode="HTML")
+
+
+# ═══════════════ STARTUP ═══════════════
+async def _post_init(app):
+    STATUS["bot_ready"] = True
+    me = await app.bot.get_me()
+    log.info(f"Bot ready: @{me.username}")
+    try:
+        migrated = migrate_actors_to_pics()
+        if migrated: log.info(f"[startup] migrated {migrated} actors → pics")
+    except Exception as e:
+        log.warning(f"[startup] migrate failed: {e}")
+    _refresh_actor_cache()
+    log.info(f"[startup] actor cache: {len(_ACTOR_CACHE['ids'])} ids")
+    try:
+        asyncio.create_task(background_fix_null_urls(app.bot))
+    except Exception as e:
+        log.warning(f"[startup] bg-fix launch failed: {e}")
+
+
+def main():
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN missing"); return
+    if not OWNER_ID:
+        print("❌ OWNER_ID missing"); return
+
+    if os.path.exists(DB_PATH):
+        ok, msg = db_integrity_check()
+        log.info(f"DB integrity: {'OK' if ok else '⚠ ' + msg}")
+    _auto_backup()
+    init_db()
+    start_health_server()
+
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .post_init(_post_init)
+           .build())
+
+    addactor_conv = ConversationHandler(
+        entry_points=[CommandHandler("addactor", addactor_start)],
+        states={
+            ASK_PHOTO:      [MessageHandler(filters.PHOTO | filters.Document.IMAGE |
+                                             (filters.TEXT & ~filters.COMMAND), addactor_photo)],
+            ASK_NAME:       [MessageHandler(filters.TEXT & ~filters.COMMAND, addactor_name)],
+            ASK_ROLE:       [CallbackQueryHandler(addactor_role_cb, pattern=r"^arole:"),
+                             MessageHandler(filters.TEXT & ~filters.COMMAND, addactor_role_txt)],
+            ASK_RARITY:     [CallbackQueryHandler(addactor_rarity_cb, pattern=r"^arar:"),
+                             MessageHandler(filters.TEXT & ~filters.COMMAND, addactor_rarity_txt)],
+            ASK_KNOWN_FOR:  [MessageHandler(filters.TEXT & ~filters.COMMAND, addactor_known_for)],
+        },
+        fallbacks=[CommandHandler("cancel", addactor_cancel)],
+        per_user=True, per_chat=False,
+    )
+    app.add_handler(addactor_conv, group=0)
+
+    addpics_conv = ConversationHandler(
+        entry_points=[CommandHandler("addpics", addpics_start)],
+        states={
+            ADD_PICS_PHOTO: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, addpics_photo),
+                             CommandHandler("done", addpics_done)],
+        },
+        fallbacks=[CommandHandler("cancel", addpics_cancel)],
+        per_user=True, per_chat=False,
+    )
+    app.add_handler(addpics_conv, group=0)
+
+    app.add_handler(CommandHandler("start", cmd_start), group=0)
+    app.add_handler(CommandHandler("menu", cmd_home), group=0)
+    app.add_handler(CommandHandler("help", cmd_help), group=0)
+    app.add_handler(CommandHandler("search", cmd_search), group=0)
+    app.add_handler(CommandHandler("collection", cmd_collection), group=0)
+    app.add_handler(CommandHandler("guess", cmd_guess), group=0)
+    app.add_handler(CommandHandler("gift", cmd_gift), group=0)
+    app.add_handler(CommandHandler("claim", cmd_claim), group=0)
+    app.add_handler(CommandHandler("check", cmd_check), group=0)
+    app.add_handler(CommandHandler("balance", cmd_balance), group=0)
+    app.add_handler(CommandHandler("viewtime", cmd_viewtime), group=0)
+    app.add_handler(CommandHandler("gate", cmd_viewtime), group=0)
+    app.add_handler(CommandHandler("rankings", cmd_rankings), group=0)
+    app.add_handler(CommandHandler("daily", cmd_daily), group=0)
+    app.add_handler(CommandHandler("weekly", cmd_weekly), group=0)
+
+    app.add_handler(CommandHandler("ohelp", cmd_ohelp), group=0)
+    app.add_handler(CommandHandler("actorlist", cmd_actorlist), group=0)
+    app.add_handler(CommandHandler("delactor", cmd_delactor), group=0)
+    app.add_handler(CommandHandler("fixurls", cmd_fixurls), group=0)
+    app.add_handler(CommandHandler("status", cmd_status), group=0)
+    app.add_handler(CommandHandler("dbcheck", cmd_dbcheck), group=0)
+    app.add_handler(CommandHandler("backup", cmd_backup), group=0)
+    app.add_handler(CommandHandler("addadmin", cmd_addadmin), group=0)
+    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin), group=0)
+    app.add_handler(CommandHandler("admins", cmd_admins), group=0)
+
+    app.add_handler(CallbackQueryHandler(
+        cb_ui, pattern=r"^ui:|^check_join$|^rk:"), group=0)
+
+    app.add_handler(InlineQueryHandler(inline_query))
+    app.add_handler(ChosenInlineResultHandler(chosen_inline))
+
+    # Message tracker — LAST group, wide filter
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+        track_message), group=10)
+
+    if app.job_queue:
+        app.job_queue.run_repeating(expire_job, interval=30, first=10)
+
+    log.info("Korean Guess Bot v3 starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    main()
