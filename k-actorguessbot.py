@@ -1,4 +1,4 @@
-# kdramabot.py — Korean Actor/Actress Guess Bot v5
+# kdramabot.py — Korean Actor/Actress Guess Bot v3.2
 # target: Python 3.11 · python-telegram-bot 21.x · Pillow 10+ · requests
 import os, io, time, math, shutil, random, sqlite3, logging, threading, json, asyncio
 from contextlib import contextmanager
@@ -23,8 +23,12 @@ BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME   = os.getenv("BOT_USERNAME", "YourKDramaBot")
 OWNER_ID       = int(os.getenv("OWNER_ID", "0"))
 OWNER_USERNAME = os.getenv("OWNER_USERNAME", "II_DEMONS_SHADOW_II")
-SUPPORT_LINK   = os.getenv("SUPPORT_LINK", "https://t.me/Demon_persnality")
-SUPPORT_NAME   = os.getenv("SUPPORT_NAME", "Demon Personality")
+
+SUPPORT_LINK   = os.getenv("SUPPORT_LINK", "https://t.me/Abyss_Anime_Community")
+SUPPORT_NAME   = os.getenv("SUPPORT_NAME", "Abyss Anime Community")
+UPDATES_LINK   = os.getenv("UPDATES_LINK", "https://t.me/Demon_persnality")
+UPDATES_NAME   = os.getenv("UPDATES_NAME", "Demon Personality")
+
 DB_PATH        = os.getenv("DB_PATH", "kdrama.db")
 LOG_LEVEL      = os.getenv("LOG_LEVEL", "INFO")
 PORT           = int(os.getenv("PORT", "8080"))
@@ -42,7 +46,6 @@ REQUIRED_CHANNELS = [
 SPAWN_MESSAGE_THRESHOLD = 100
 SPAWN_EXPIRY_SECONDS    = 600
 GUESS_REWARD_COINS      = 50
-VIEWTIME_COST           = 50
 
 DAILY_COINS     = 100
 WEEKLY_COINS    = 2000
@@ -50,15 +53,13 @@ DAILY_COOLDOWN  = timedelta(hours=24)
 WEEKLY_COOLDOWN = timedelta(days=7)
 CLAIM_COOLDOWN  = timedelta(hours=24)
 
-SPAM_WINDOW       = 60
-SPAM_LIMIT        = 10
-SPAM_LEVEL1_IGNORE = 300
-SPAM_LEVEL2_IGNORE = 1200
-
 BACKUP_DIR  = "backups"
 BACKUP_KEEP = 10
 TELEGRAPH_DELAY = 1.2
 ACTOR_CACHE_TTL = 60
+
+SPAM_WINDOW = 120
+SPAM_LIMIT  = 15
 
 CLAIM_WEIGHTS = {
     "Extra":50, "Side":40, "Supporting":30, "Main Cast":15,
@@ -76,7 +77,7 @@ _ACTOR_CACHE = {"ids": [], "rarities": {}, "ts": 0}
 _CACHE_LOCK = threading.Lock()
 
 _SPAM_TRACK = {}
-_SPAM_LOCK  = threading.Lock()
+_SPAM_LOCK = threading.Lock()
 
 
 # ═══════════════ FONTS ═══════════════
@@ -92,6 +93,15 @@ def bi(t):
     for ch in t:
         if "A" <= ch <= "Z": o.append(chr(0x1D468 + ord(ch) - ord("A")))
         elif "a" <= ch <= "z": o.append(chr(0x1D482 + ord(ch) - ord("a")))
+        else: o.append(ch)
+    return "".join(o)
+
+def bold(t):
+    o = []
+    for ch in t:
+        if "A" <= ch <= "Z": o.append(chr(0x1D400 + ord(ch) - ord("A")))
+        elif "a" <= ch <= "z": o.append(chr(0x1D41A + ord(ch) - ord("a")))
+        elif "0" <= ch <= "9": o.append(chr(0x1D7CE + ord(ch) - ord("0")))
         else: o.append(ch)
     return "".join(o)
 
@@ -157,6 +167,7 @@ def init_db():
         user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
         coins INTEGER DEFAULT 0, points INTEGER DEFAULT 0,
         last_daily TEXT, last_weekly TEXT, last_claim TEXT,
+        mode_rarity TEXT DEFAULT 'All',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP)""")
     c.execute("""CREATE TABLE IF NOT EXISTS actors (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -203,17 +214,9 @@ def init_db():
         c.execute(idx)
     try: c.execute("ALTER TABLE players ADD COLUMN last_claim TEXT")
     except sqlite3.OperationalError: pass
+    try: c.execute("ALTER TABLE players ADD COLUMN mode_rarity TEXT DEFAULT 'All'")
+    except sqlite3.OperationalError: pass
     conn.commit()
-
-    try:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        c.execute("UPDATE spawns SET status='expired' WHERE status='active' AND expires_at<?", (now_iso,))
-        n = c.rowcount
-        if n: log.info(f"[init] force-expired {n} stale spawns")
-        conn.commit()
-    except Exception as e:
-        log.warning(f"[init] expire failed: {e}")
-
     log.info("DB initialized (pooled)")
 
 
@@ -258,10 +261,9 @@ def add_coins_and_points(user_id, coins=0, points=0):
 def add_coins(user_id, amount):
     with get_conn() as conn:
         c = conn.cursor()
-        c.execute("UPDATE players SET coins = MAX(0, COALESCE(coins,0) + ?) WHERE user_id=?",
-                  (amount, user_id))
+        c.execute("UPDATE players SET coins = COALESCE(coins,0) + ? WHERE user_id=?", (amount, user_id))
         if c.rowcount == 0:
-            c.execute("INSERT INTO players (user_id, coins) VALUES (?,?)", (user_id, max(0, amount)))
+            c.execute("INSERT INTO players (user_id, coins) VALUES (?,?)", (user_id, amount))
 
 
 def get_coins(user_id):
@@ -281,6 +283,23 @@ def get_points(user_id):
 def set_player_field(uid, field, value):
     with get_conn() as conn:
         conn.execute(f"UPDATE players SET {field}=? WHERE user_id=?", (value, uid))
+
+
+def get_kmode(uid):
+    try:
+        c = _conn().cursor()
+        c.execute("SELECT mode_rarity FROM players WHERE user_id=?", (uid,))
+        row = c.fetchone()
+        if row and row["mode_rarity"]:
+            return row["mode_rarity"]
+    except Exception:
+        pass
+    return "All"
+
+
+def set_kmode(uid, rarity):
+    with get_conn() as conn:
+        conn.execute("UPDATE players SET mode_rarity=? WHERE user_id=?", (rarity, uid))
 
 
 def is_admin(uid):
@@ -449,12 +468,6 @@ def get_all_actors():
     return [dict(r) for r in c.fetchall()]
 
 
-def count_all_actors():
-    c = _conn().cursor()
-    c.execute("SELECT COUNT(*) FROM actors WHERE active=1")
-    return c.fetchone()[0]
-
-
 def search_actors(q, limit=50):
     c = _conn().cursor()
     if q:
@@ -527,14 +540,7 @@ def get_active_spawn(chat_id):
     c.execute("""SELECT * FROM spawns WHERE chat_id=? AND status='active'
                  ORDER BY id DESC LIMIT 1""", (chat_id,))
     row = c.fetchone()
-    if not row: return None
-    d = dict(row)
-    exp = _parse_dt(d.get("expires_at"))
-    if exp and exp < _now():
-        with get_conn() as conn2:
-            conn2.execute("UPDATE spawns SET status='expired' WHERE id=?", (d["id"],))
-        return None
-    return d
+    return dict(row) if row else None
 
 
 def try_grab_spawn(spawn_id, user_id):
@@ -598,13 +604,6 @@ def track_group_member(chat_id, user_id):
     with get_conn() as conn:
         conn.execute("INSERT OR IGNORE INTO group_members (chat_id, user_id) VALUES (?,?)",
                      (chat_id, user_id))
-
-
-def get_group_stats(chat_id):
-    c = _conn().cursor()
-    c.execute("SELECT msg_count, total_spawns, last_spawn FROM group_counters WHERE chat_id=?", (chat_id,))
-    row = c.fetchone()
-    return dict(row) if row else {"msg_count": 0, "total_spawns": 0, "last_spawn": None}
 
 
 def db_stats():
@@ -676,36 +675,6 @@ def role_emoji(r): return "👨" if r == "actor" else "👩"
 def role_label(r): return "Actor" if r == "actor" else "Actress"
 
 
-# ═══════════════ SPAM FILTER ═══════════════
-def check_spam(chat_id, user_id):
-    now = time.time()
-    with _SPAM_LOCK:
-        key = (chat_id, user_id)
-        state = _SPAM_TRACK.get(key)
-        if state is None:
-            state = {"times": [], "ignore_until": 0, "level": 0}
-            _SPAM_TRACK[key] = state
-        if len(_SPAM_TRACK) > 5000:
-            cutoff = now - 3600
-            for k in list(_SPAM_TRACK.keys()):
-                st = _SPAM_TRACK[k]
-                if st["ignore_until"] < now and (not st["times"] or max(st["times"]) < cutoff):
-                    _SPAM_TRACK.pop(k, None)
-        if state["ignore_until"] > now:
-            return (True, False, 0, state["level"])
-        if state["ignore_until"] > 0 and state["ignore_until"] <= now:
-            state["ignore_until"] = 0
-        state["times"] = [t for t in state["times"] if now - t < SPAM_WINDOW]
-        state["times"].append(now)
-        if len(state["times"]) >= SPAM_LIMIT:
-            state["level"] += 1
-            duration = SPAM_LEVEL1_IGNORE if state["level"] == 1 else SPAM_LEVEL2_IGNORE
-            state["ignore_until"] = now + duration
-            state["times"] = []
-            return (True, True, duration // 60, state["level"])
-        return (False, False, 0, state["level"])
-
-
 # ═══════════════ TELEGRAPH ═══════════════
 async def fileid_to_public_url(bot, file_id):
     if not file_id: return None
@@ -758,7 +727,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
             ok, integrity = db_integrity_check()
             payload = {
                 "status": "ok" if ok and STATUS["bot_ready"] else "degraded",
-                "service": "korean-guess-bot", "version": "v5",
+                "service": "korean-guess-bot", "version": "v3.2",
                 "uptime_seconds": up, "uptime_human": str(timedelta(seconds=up)),
                 "bot_ready": STATUS["bot_ready"], "bot_username": BOT_USERNAME,
                 "db": {
@@ -766,6 +735,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
                     "size_kb": os.path.getsize(DB_PATH)//1024 if os.path.exists(DB_PATH) else 0,
                     "integrity": integrity, "counts": db_stats(),
                 },
+                "actor_cache": {"ids": len(_ACTOR_CACHE["ids"]),
+                                "age_s": int(time.time() - _ACTOR_CACHE["ts"]) if _ACTOR_CACHE["ts"] else 0},
+                "last_spawn_ts": STATUS["last_spawn_ts"],
                 "ts": datetime.utcnow().isoformat() + "Z",
             }
             self._send(200 if payload["status"] == "ok" else 503, payload)
@@ -784,6 +756,20 @@ def start_health_server():
         log.info(f"Health: http://{HEALTH_HOST}:{PORT}/health")
     except Exception as e:
         log.warning(f"health skipped: {e}")
+
+
+# ═══════════════ SPAM FILTER ═══════════════
+def is_spamming(chat_id, user_id):
+    now = time.time()
+    with _SPAM_LOCK:
+        key = (chat_id, user_id)
+        times = _SPAM_TRACK.get(key, [])
+        times = [t for t in times if now - t < SPAM_WINDOW]
+        times.append(now)
+        _SPAM_TRACK[key] = times
+        if len(_SPAM_TRACK) > 5000:
+            _SPAM_TRACK.clear()
+        return len(times) > SPAM_LIMIT
 
 
 # ═══════════════ HELPERS ═══════════════
@@ -805,24 +791,21 @@ def kb_join():
     return InlineKeyboardMarkup(rows)
 
 
-def kb_start_main(uid=None):
-    """
-    If uid given → My Collection button prefills 'collection.<uid>' so user's
-    own UID is already embedded in the inline query. If uid is None (group chat
-    where any member may tap) → generic 'collection.' query, and the inline
-    handler uses the tapper's own UID.
-    """
+def kb_start_main():
+    """5 buttons · 4 rows · Add Me / Support+Updates / Help / Owner-King"""
     add_link = f"https://t.me/{BOT_USERNAME}?startgroup=true"
-    coll_query = f"collection.{uid}" if uid else "collection."
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"➕ {sc('Add Me To Your GC')} ➕", url=add_link)],
-        [InlineKeyboardButton(f"🎴 {sc('My Collection')}",
-            switch_inline_query_current_chat=coll_query)],
+        # Row 1 — Add Me
+        [InlineKeyboardButton(f"🎯 {sc('Add Me To Your GC')}", url=add_link)],
+        # Row 2 — Support + Updates
         [
             InlineKeyboardButton(f"💬 {sc('Support')}", url=SUPPORT_LINK),
-            InlineKeyboardButton(f"❓ {sc('Help')}", callback_data="ui:help"),
+            InlineKeyboardButton(f"📢 {sc('Updates')}", url=UPDATES_LINK),
         ],
-        [InlineKeyboardButton(f"👑 {sc('Owner')}", url=f"https://t.me/{OWNER_USERNAME}")],
+        # Row 3 — Help & Commands
+        [InlineKeyboardButton(f"❓ {sc('Help & Commands')}", callback_data="ui:help")],
+        # Row 4 — Owner / King
+        [InlineKeyboardButton(f"👑 {sc('Owner / King')}", url=f"https://t.me/{OWNER_USERNAME}")],
     ])
 
 
@@ -842,13 +825,29 @@ def _kb_rankings():
 
 
 def kb_collection_buttons(uid):
-    """My Collection button prefills 'collection.<uid>' — user UID embedded directly."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🎴 {sc('Open My Gallery')}",
-            switch_inline_query_current_chat=f"collection.{uid}")],
+            switch_inline_query_current_chat="collection.")],
+        [InlineKeyboardButton(f"🎯 {sc('Kmode')}", callback_data="ui:kmode")],
         [InlineKeyboardButton(f"🔍 {sc('Search All Characters')}",
             switch_inline_query_current_chat="")],
     ])
+
+
+def _kb_kmode(current="All"):
+    rows = []
+    rows.append([InlineKeyboardButton(
+        f"🌐 {sc('All')}" + (" ✅" if current == "All" else ""),
+        callback_data="kmode:All")])
+    row = []
+    for r, e in RARITY_EMOJI.items():
+        chk = " ✅" if current == r else ""
+        row.append(InlineKeyboardButton(f"{e} {r}{chk}", callback_data=f"kmode:{r}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton(f"🔙 {sc('Back')}", callback_data="ui:coll")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ═══════════════ TEXTS ═══════════════
@@ -873,15 +872,17 @@ HELP_TEXT = (
     "🏠 <code>/menu</code> — Home\n"
     "🔍 <code>/search</code> — Global search\n"
     "📦 <code>/collection</code> — Your collection\n"
+    "🎯 <code>/kmode</code> — Collection rarity filter\n"
     "💰 <code>/balance</code> — Coins and points\n"
     "🎯 <code>/guess &lt;name&gt;</code> — Catch a spawn\n"
     "🎁 <code>/gift</code> — Gift a character\n"
     "🎰 <code>/claim</code> — Free random character (24h)\n"
     "🔎 <code>/check &lt;id&gt;</code> — Actor info by ID\n"
-    "⏰ <code>/viewtime</code> — Gate timer (50 coins)\n"
+    "⏰ <code>/viewtime</code> — Gate progress\n"
     "🏆 <code>/rankings</code> — Leaderboards\n"
     "💰 <code>/daily</code> — 100 coins (24h)\n"
-    "💰 <code>/weekly</code> — 2000 coins (7d)\n\n"
+    "💰 <code>/weekly</code> — 2000 coins (7d)\n"
+    "📢 <code>/broadcast</code> — Owner broadcast\n\n"
     "💙 <i>Powered by Abyss Dimension</i>"
 )
 
@@ -916,14 +917,13 @@ async def cmd_start(update, context):
                 "<i>Join both, then tap 'I have Joined'.</i>",
                 parse_mode="HTML", reply_markup=kb_join())
             return
-    is_private = update.effective_chat.type == "private"
-    kb = kb_start_main(u.id if is_private else None)
     try:
         await update.message.reply_photo(photo=START_PHOTO, caption=START_TEXT,
-            parse_mode="HTML", reply_markup=kb)
+            parse_mode="HTML", reply_markup=kb_start_main())
     except Exception:
         try:
-            await update.message.reply_text(START_TEXT, parse_mode="HTML", reply_markup=kb)
+            await update.message.reply_text(START_TEXT, parse_mode="HTML",
+                reply_markup=kb_start_main())
         except Exception: pass
 
 
@@ -940,10 +940,9 @@ async def cmd_ohelp(update, context):
 
 # ═══════════════ SEARCH ═══════════════
 async def cmd_search(update, context):
-    u = update.effective_user
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🎴 {sc('My Collection')}",
-            switch_inline_query_current_chat=f"collection.{u.id}")],
+            switch_inline_query_current_chat="collection.")],
         [InlineKeyboardButton(f"🔍 {sc('Search All Characters')}",
             switch_inline_query_current_chat="")],
     ])
@@ -996,89 +995,52 @@ async def cmd_balance(update, context):
     coins = get_coins(u.id)
     points = get_points(u.id)
     total = count_user_actors(u.id)
-    total_db = count_all_actors()
     await update.message.reply_text(
         f"💰 {sc('Balance')}\n\n"
         f"👤 <b>{u.first_name or 'Hunter'}</b>\n"
-        f"🆔 <code>{u.id}</code>\n"
         f"💵 Coins: <b>{coins}</b>\n"
         f"🏆 Points: <b>{points}</b>\n"
-        f"🎴 Your collection: <b>{total}</b>\n"
-        f"📚 Total actors in bot: <b>{total_db}</b>",
+        f"🎴 Collection: <b>{total}</b>",
         parse_mode="HTML")
 
 
 # ═══════════════ VIEWTIME ═══════════════
 async def cmd_viewtime(update, context):
     chat = update.effective_chat
-    u = update.effective_user
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text("❌ This command works in groups only."); return
-
-    get_or_create_player(u.id, u.username, u.first_name)
-    coins = get_coins(u.id)
-    if coins < VIEWTIME_COST:
-        await update.message.reply_text(
-            f"❌ <b>You don't have coins to see down time.</b>\n\n"
-            f"💵 Needed: <b>{VIEWTIME_COST}</b> coins\n"
-            f"💼 You have: <b>{coins}</b>",
-            parse_mode="HTML")
-        return
-
-    add_coins(u.id, -VIEWTIME_COST)
-
     active = get_active_spawn(chat.id)
     if active:
-        exp = _parse_dt(active.get("expires_at"))
-        now = _now()
-        if exp:
-            left_sec = max(0, int((exp - now).total_seconds()))
-            m, s = divmod(left_sec, 60)
-            time_str = f"{m}m {s}s"
-        else:
-            time_str = "—"
         await update.message.reply_text(
-            f"⏰ <b>A spawn is active</b>\n\n"
-            f"⏳ Time left: <b>{time_str}</b>\n\n"
-            f"Use <code>/guess &lt;name&gt;</code> to grab it.",
+            "⚠️ <b>A spawn is already active.</b>\n\n"
+            "Use <code>/guess &lt;name&gt;</code> to grab it.",
             parse_mode="HTML")
         return
-
     stats = get_group_stats(chat.id)
     cur = stats.get("msg_count", 0)
-    last_spawn = stats.get("last_spawn")
+    total = stats.get("total_spawns", 0)
+    last = stats.get("last_spawn")
     rem = max(0, SPAWN_MESSAGE_THRESHOLD - cur)
     pct = min(100, int((cur / SPAWN_MESSAGE_THRESHOLD) * 100))
     filled = int(pct / 10)
     bar = "█" * filled + "░" * (10 - filled)
-
-    est_str = ""
-    if last_spawn and cur > 0:
-        try:
-            last_dt = datetime.fromisoformat(last_spawn)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-            elapsed = (_now() - last_dt).total_seconds()
-            if elapsed > 0 and cur > 0:
-                per_msg = elapsed / cur
-                est_sec = int(per_msg * rem)
-                em, es = divmod(est_sec, 60)
-                if em >= 60:
-                    eh, em = divmod(em, 60)
-                    est_str = f"\n⏱ Estimated: <b>~{eh}h {em}m</b>"
-                else:
-                    est_str = f"\n⏱ Estimated: <b>~{em}m {es}s</b>"
-        except Exception: pass
-
     txt = (
-        f"⏰ <b>Gate Status</b>\n\n"
+        "⏰ <b>GATE STATUS</b>\n\n"
         f"📨 Messages: <b>{cur}/{SPAWN_MESSAGE_THRESHOLD}</b>\n"
         f"📊 <code>{bar}</code> <b>{pct}%</b>\n\n"
-        f"⏳ Need <b>{rem}</b> more messages"
-        f"{est_str}\n\n"
-        f"<i>-{VIEWTIME_COST} coins</i>"
+        f"⏳ <b>{rem}</b> messages until next spawn\n"
+        f"🎯 Total spawns: <b>{total}</b>"
     )
+    if last:
+        txt += f"\n🕐 Last spawn: <code>{last}</code>"
     await update.message.reply_text(txt, parse_mode="HTML")
+
+
+def get_group_stats(chat_id):
+    c = _conn().cursor()
+    c.execute("SELECT msg_count, total_spawns, last_spawn FROM group_counters WHERE chat_id=?", (chat_id,))
+    row = c.fetchone()
+    return dict(row) if row else {"msg_count": 0, "total_spawns": 0, "last_spawn": None}
 
 
 # ═══════════════ RANKINGS ═══════════════
@@ -1087,58 +1049,101 @@ async def cmd_rankings(update, context):
         parse_mode="HTML", reply_markup=_kb_rankings())
 
 
-# ═══════════════ INLINE QUERY (robust collection) ═══════════════
+# ═══════════════ KMODE ═══════════════
+async def cmd_kmode(update, context):
+    u = update.effective_user
+    get_or_create_player(u.id, u.username, u.first_name)
+    current = get_kmode(u.id) or "All"
+    await update.message.reply_text(
+        f"🎯 <b>{sc('Kmode')}</b>\n\n"
+        f"<b>Current filter:</b> {current}\n\n"
+        f"<i>Select the rarity you want to see in your collection gallery.</i>",
+        parse_mode="HTML", reply_markup=_kb_kmode(current))
+
+
+async def cb_kmode(update, context):
+    q = update.callback_query
+    rarity = q.data.split(":", 1)[1]
+    if rarity != "All" and rarity not in RARITY_EMOJI:
+        await q.answer("Invalid!", show_alert=True); return
+    get_or_create_player(q.from_user.id, q.from_user.username, q.from_user.first_name)
+    set_kmode(q.from_user.id, rarity)
+    await q.answer(f"✅ Kmode: {rarity}")
+    txt = (f"🎯 <b>{sc('Kmode')}</b>\n\n"
+           f"<b>Current filter:</b> {rarity}\n\n"
+           f"<i>Now your gallery &amp; summary will show only this rarity.</i>")
+    try:
+        if q.message.caption is not None:
+            await q.edit_message_caption(caption=txt, parse_mode="HTML",
+                reply_markup=_kb_kmode(rarity))
+        else:
+            await q.edit_message_text(txt, parse_mode="HTML",
+                reply_markup=_kb_kmode(rarity))
+    except Exception:
+        pass
+
+
+# ═══════════════ INLINE QUERY (self-only) ═══════════════
 async def inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     raw = (update.inline_query.query or "").strip()
     uid = update.inline_query.from_user.id
     log.info(f"[inline] raw='{raw}' uid={uid}")
 
-    low = raw.lower()
-    target = uid      # default = tapper's own
+    low = raw.lower().strip()
     mode = "search"
     search_q = raw
 
-    # ── collection mode ──
-    if low == "my" or low.startswith("collection"):
+    is_coll = False
+    if low in ("my", "mycollection", "collection", "coll", "col"):
+        is_coll = True
+    else:
+        for pfx in ("mycollection", "collection", "coll", "col"):
+            if low.startswith(pfx):
+                tail = low[len(pfx):]
+                if tail == "" or tail[0] in ". _:@-0123456789":
+                    is_coll = True
+                    break
+
+    if is_coll:
         mode = "collection"
-        suffix = ""
-        if "." in raw:
-            suffix = raw.split(".", 1)[1].strip()
-        elif " " in raw:
-            suffix = raw.split(" ", 1)[1].strip()
-        if suffix.isdigit():
-            target = int(suffix)
-        # else: target stays = tapper's uid (auto-detect)
         search_q = None
+        # 🔒 LOCKED: always self
     elif low.startswith("all"):
-        mode = "search"
         search_q = raw[3:].strip(": ").strip()
 
+    log.info(f"[inline] mode={mode} uid={uid} search='{search_q}'")
+
     if mode == "collection":
-        grouped = get_user_actors_grouped(target)
+        grouped = get_user_actors_grouped(uid)
+        kmode_r = get_kmode(uid) or "All"
         actors = []
-        for r in RARITY_ORDER:
-            if r in grouped:
-                actors.extend(grouped[r])
-        actors = actors[:50]
-        if target == uid:
-            empty_msg = ("Your collection is empty. Wait for a spawn in the group "
-                         "and use /guess <name> to grab one.")
+        if kmode_r != "All":
+            actors = list(grouped.get(kmode_r, []))[:50]
         else:
-            empty_msg = "This user's collection is empty."
+            for r in RARITY_ORDER:
+                if r in grouped:
+                    actors.extend(grouped[r])
+            actors = actors[:50]
+        empty_msg = ("🌑 Your collection is empty. Wait for a spawn in the group "
+                     "and use /guess <name> to grab one.")
     else:
         actors = search_actors(search_q, 50)
         empty_msg = (f"No results for '{search_q}'."
                      if search_q else "No characters added yet.")
 
-    log.info(f"[inline] mode={mode} target={target} actors={len(actors)}")
-
     results = []
     for a in actors:
         cover = get_cover_url(a["id"])
         cover_fid = get_cover_file_id(a["id"])
-        pc = count_pics(a["id"]) or (1 if cover_fid or cover else 0)
-        caption = (f"🎴 <b>{a['name']}</b>\n"
+        if not cover and not cover_fid:
+            if a.get("image_source") == "url" and a.get("image_url"):
+                cover = a["image_url"]
+            elif a.get("file_id"):
+                cover_fid = a["file_id"]
+        pc = count_pics(a["id"]) or (1 if (cover_fid or cover) else 0)
+        dup = a.get("user_dup_count", 1)
+        dup_str = f" ×{dup}" if dup and dup > 1 else ""
+        caption = (f"🎴 <b>{a['name']}</b>{dup_str}\n"
                    f"📺 {a.get('known_for') or '—'}\n"
                    f"⭐ {a.get('rarity','')}\n"
                    f"🖼 {pc} pics")
@@ -1193,17 +1198,9 @@ async def chosen_inline(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _show_collection(q_or_msg, context, user):
     uid = user.id
     total = count_user_actors(uid)
-    total_db = count_all_actors()
-
     if total == 0:
-        txt = (
-            f"🌑 <b>{user.first_name or 'Hunter'}'s Collection</b>\n\n"
-            f"🆔 Your UID: <code>{uid}</code>\n"
-            f"📚 Actors in bot: <b>{total_db}</b>\n"
-            f"🎴 Your collection: <b>0</b>\n\n"
-            f"<i>Your collection is empty. Wait for a spawn in the group, "
-            f"then use /guess to catch one.</i>"
-        )
+        txt = ("🌑 <b>Your collection is empty.</b>\n\n"
+               "Wait for a spawn in the group, then use /guess to catch one.")
         try:
             if hasattr(q_or_msg, "edit_message_text"):
                 if q_or_msg.message.caption is not None:
@@ -1219,18 +1216,22 @@ async def _show_collection(q_or_msg, context, user):
 
     coins = get_coins(uid); points = get_points(uid)
     rc = get_user_rarity_counts(uid)
+    kmode_r = get_kmode(uid) or "All"
 
     lines = [
         f"🎴 <b>{user.first_name or 'Hunter'}'s Collection</b>",
-        f"🆔 Your UID: <code>{uid}</code>",
         f"💰 Coins: <b>{coins}</b>  |  🏆 Points: <b>{points}</b>",
-        f"📚 Actors in bot: <b>{total_db}</b>",
-        f"🌸 Your collection: <b>{total}</b>",
+        f"🌸 Total: <b>{total}</b>",
+        f"🎯 Kmode: <b>{kmode_r}</b>",
         "━━━━━━━━━━━━━━━━━━━━━━",
     ]
-    for r in RARITY_ORDER:
-        if r in rc:
-            lines.append(f"{RARITY_EMOJI.get(r,'⚪')} <b>{r}</b>: {rc[r]}")
+    if kmode_r == "All":
+        for r in RARITY_ORDER:
+            if r in rc:
+                lines.append(f"{RARITY_EMOJI.get(r,'⚪')} <b>{r}</b>: {rc[r]}")
+    else:
+        cnt = rc.get(kmode_r, 0)
+        lines.append(f"{RARITY_EMOJI.get(kmode_r,'⚪')} <b>{kmode_r}</b>: {cnt}")
     lines.append("")
     lines.append("<i>Tap below to open your gallery.</i>")
 
@@ -1284,19 +1285,34 @@ async def cb_ui(update, context):
         return
 
     if data == "ui:back":
-        is_private = q.message.chat.type == "private"
-        kb = kb_start_main(q.from_user.id if is_private else None)
         try:
             if q.message.caption is not None:
                 await q.edit_message_caption(caption=START_TEXT, parse_mode="HTML",
-                    reply_markup=kb)
+                    reply_markup=kb_start_main())
             else:
-                await q.edit_message_text(START_TEXT, parse_mode="HTML", reply_markup=kb)
+                await q.edit_message_text(START_TEXT, parse_mode="HTML",
+                    reply_markup=kb_start_main())
         except Exception: pass
         return
 
     if data == "ui:coll":
         await _show_collection(q, context, q.from_user); return
+
+    if data == "ui:kmode":
+        current = get_kmode(q.from_user.id) or "All"
+        txt = (f"🎯 <b>{sc('Kmode')}</b>\n\n"
+               f"<b>Current filter:</b> {current}\n\n"
+               f"<i>Only the selected rarity will show in your gallery &amp; summary.</i>")
+        try:
+            if q.message.caption is not None:
+                await q.edit_message_caption(caption=txt, parse_mode="HTML",
+                    reply_markup=_kb_kmode(current))
+            else:
+                await q.edit_message_text(txt, parse_mode="HTML",
+                    reply_markup=_kb_kmode(current))
+        except Exception:
+            pass
+        return
 
     if data == "ui:rank":
         try:
@@ -1582,7 +1598,7 @@ async def cmd_weekly(update, context):
         f"💼 Balance: <b>{get_coins(u.id)}</b>\n⏰ Next in 7 days", parse_mode="HTML")
 
 
-# ═══════════════ MESSAGE TRACKER + SPAM ═══════════════
+# ═══════════════ SPAWN ═══════════════
 async def track_message(update, context):
     try:
         chat = update.effective_chat
@@ -1592,24 +1608,7 @@ async def track_message(update, context):
         chat_id = chat.id
         user_id = u.id
 
-        ignored, alert, minutes, level = check_spam(chat_id, user_id)
-        if ignored:
-            if alert:
-                mention = f"@{u.username}" if u.username else u.first_name
-                try:
-                    if level == 1:
-                        await context.bot.send_message(chat_id,
-                            f"🚫 <b>Spam Detected</b>\n\n"
-                            f"{mention}, please slow down.\n"
-                            f"Your messages will be ignored for <b>{minutes} minutes</b>.",
-                            parse_mode="HTML")
-                    else:
-                        await context.bot.send_message(chat_id,
-                            f"🚫 <b>Still Spamming!</b>\n\n"
-                            f"{mention}, you are being ignored for <b>{minutes} minutes</b>.",
-                            parse_mode="HTML")
-                except Exception as e:
-                    log.warning(f"[spam-alert] {e}")
+        if is_spamming(chat_id, user_id):
             return
 
         try:
@@ -1995,6 +1994,80 @@ async def cmd_admins(update, context):
     await update.message.reply_text(txt, parse_mode="HTML")
 
 
+# ═══════════════ BROADCAST (OWNER ONLY) ═══════════════
+async def cmd_broadcast(update, context):
+    u = update.effective_user
+
+    if not u or u.id != OWNER_ID:
+        log.warning(f"[broadcast] BLOCKED unauthorized: uid={getattr(u,'id',None)} "
+                    f"uname={getattr(u,'username',None)}")
+        try:
+            await update.message.reply_text(
+                "🚫 <b>Owner only command.</b>\n\n"
+                "<i>This command is restricted to the bot owner.</i>",
+                parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    reply = update.message.reply_to_message
+    if not reply and not context.args:
+        await update.message.reply_text(
+            "📢 <b>Broadcast</b>\n\n"
+            "<code>/broadcast &lt;message&gt;</code>\n"
+            "<i>or reply to any message with</i> <code>/broadcast</code>\n\n"
+            "<i>Supports: text, photo, video, document, sticker.</i>",
+            parse_mode="HTML")
+        return
+
+    c = _conn().cursor()
+    c.execute("SELECT user_id FROM players")
+    users = [r["user_id"] for r in c.fetchall()]
+    c.execute("SELECT chat_id FROM group_counters")
+    groups = [r["chat_id"] for r in c.fetchall()]
+    targets = list(dict.fromkeys(users + groups))
+
+    if not targets:
+        await update.message.reply_text("📭 No targets."); return
+
+    status = await update.message.reply_text(
+        f"📢 <b>Broadcasting...</b>\n0/{len(targets)}", parse_mode="HTML")
+
+    sent = 0; failed = 0
+    for i, tid in enumerate(targets):
+        try:
+            if reply:
+                await context.bot.copy_message(
+                    chat_id=tid,
+                    from_chat_id=update.effective_chat.id,
+                    message_id=reply.message_id)
+            else:
+                await context.bot.send_message(
+                    tid, " ".join(context.args),
+                    parse_mode="HTML", disable_web_page_preview=True)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            log.debug(f"[broadcast] fail {tid}: {e}")
+        if (i + 1) % 15 == 0:
+            try:
+                await status.edit_text(
+                    f"📢 <b>Broadcasting...</b>\n{i+1}/{len(targets)}\n"
+                    f"✅ {sent}  ❌ {failed}", parse_mode="HTML")
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)
+
+    try:
+        await status.edit_text(
+            f"✅ <b>{sc('Broadcast Complete')}</b>\n\n"
+            f"📊 Total: <b>{len(targets)}</b>\n"
+            f"✅ Sent: <b>{sent}</b>\n"
+            f"❌ Failed: <b>{failed}</b>", parse_mode="HTML")
+    except Exception:
+        await update.message.reply_text(f"✅ Sent: {sent} | ❌ Failed: {failed}")
+
+
 # ═══════════════ STARTUP ═══════════════
 async def _post_init(app):
     STATUS["bot_ready"] = True
@@ -2007,11 +2080,6 @@ async def _post_init(app):
         log.warning(f"[startup] migrate failed: {e}")
     _refresh_actor_cache()
     log.info(f"[startup] actor cache: {len(_ACTOR_CACHE['ids'])} ids")
-    try:
-        n = expire_spawns()
-        if n: log.info(f"[startup] force-expired {n} spawns")
-    except Exception as e:
-        log.warning(f"[startup] expire failed: {e}")
     try:
         asyncio.create_task(background_fix_null_urls(app.bot))
     except Exception as e:
@@ -2079,6 +2147,7 @@ def main():
     app.add_handler(CommandHandler("rankings", cmd_rankings), group=0)
     app.add_handler(CommandHandler("daily", cmd_daily), group=0)
     app.add_handler(CommandHandler("weekly", cmd_weekly), group=0)
+    app.add_handler(CommandHandler("kmode", cmd_kmode), group=0)
 
     app.add_handler(CommandHandler("ohelp", cmd_ohelp), group=0)
     app.add_handler(CommandHandler("actorlist", cmd_actorlist), group=0)
@@ -2091,8 +2160,16 @@ def main():
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin), group=0)
     app.add_handler(CommandHandler("admins", cmd_admins), group=0)
 
+    # 🔒 Broadcast — owner only (double protection)
+    app.add_handler(
+        CommandHandler("broadcast", cmd_broadcast,
+                       filters=filters.User(user_id=OWNER_ID)),
+        group=0
+    )
+
     app.add_handler(CallbackQueryHandler(
         cb_ui, pattern=r"^ui:|^check_join$|^rk:"), group=0)
+    app.add_handler(CallbackQueryHandler(cb_kmode, pattern=r"^kmode:"), group=0)
 
     app.add_handler(InlineQueryHandler(inline_query))
     app.add_handler(ChosenInlineResultHandler(chosen_inline))
@@ -2104,11 +2181,9 @@ def main():
     if app.job_queue:
         app.job_queue.run_repeating(expire_job, interval=30, first=10)
 
-    log.info("Korean Guess Bot v5 starting...")
+    log.info("Korean Guess Bot v3.2 starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.set_event_loop(asyncio.new_event_loop())
     main()
